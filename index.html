@@ -303,14 +303,17 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
   const poc = sorted[0];
 
   // 去密函数：相邻间距 < gapPct 时合并，保留量能更强的
-  function dedupe(levels, refPrice, gapPct) {
+  // ⚠️ 用 last.priceMid 做分母（不用 currentPrice），避免远离当前价时间距被低估
+  function dedupe(levels, _refPrice, gapPct) {
     const result = [];
     for (const lv of levels) {
       const last = result[result.length - 1];
       if (!last) { result.push(lv); continue; }
-      const gap = Math.abs(lv.priceMid - last.priceMid) / refPrice * 100;
+      // 用两档价格的均值做分母，结果更稳定
+      const midRef = (lv.priceMid + last.priceMid) / 2;
+      const gap = Math.abs(lv.priceMid - last.priceMid) / midRef * 100;
       if (gap < gapPct) {
-        // 间距不足：两个节点合并，保留量能更强的那个
+        // 间距不足：保留量能更强的那个
         if (lv.volume > last.volume) result[result.length - 1] = lv;
       } else {
         result.push(lv);
@@ -1249,9 +1252,9 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
             let cumQty = 0, cumNotional = 0, cumMarginAcc = 0;
             const tiersEnriched = tiers.map((t, i) => {
               const prev = tiers[i - 1];
-              // 档间距（与上一档目标价的百分比距离）
+              // 档间距（用两档均值做分母，与 dedupe 保持一致）
               const gapPct = prev
-                ? Math.abs((t.price - prev.price) / prev.price * 100)
+                ? Math.abs((t.price - prev.price) / ((t.price + prev.price) / 2) * 100)
                 : null;
               // 用名义金额计算均价（价格维度，与杠杆无关）
               const qty = t.amount / t.price;
