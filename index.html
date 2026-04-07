@@ -7,6 +7,7 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
   <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/prop-types/15.8.1/prop-types.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/recharts/2.12.0/Recharts.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.10/babel.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -110,7 +111,7 @@ const {
   LineChart, Line, AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   ReferenceLine, ComposedChart, Cell
-} = Recharts;
+} = window.Recharts;
 
 // ─────────────────────────────────────────────
 // DB LAYER
@@ -188,12 +189,27 @@ create table if not exists crypto_martin_trades (
 // ─────────────────────────────────────────────
 // BINANCE API
 // ─────────────────────────────────────────────
-const BINANCE = 'https://api.binance.com';
+// 多节点自动切换，解决部分地区 CORS/访问问题
+const BINANCE_NODES = [
+  'https://api.binance.com',
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+  'https://api3.binance.com',
+];
+
+async function binanceFetch(path) {
+  let lastErr;
+  for (const base of BINANCE_NODES) {
+    try {
+      const res = await fetch(base + path, { mode: 'cors' });
+      if (res.ok) return res.json();
+    } catch(e) { lastErr = e; }
+  }
+  throw lastErr || new Error('所有 Binance 节点均不可用');
+}
 
 async function fetchKlines(symbol, interval = '1h', limit = 500) {
-  const res = await fetch(`${BINANCE}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
-  if (!res.ok) throw new Error(`Binance error ${res.status}`);
-  const raw = await res.json();
+  const raw = await binanceFetch(`/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`);
   return raw.map(k => ({
     time:   k[0],
     open:   parseFloat(k[1]),
@@ -206,15 +222,12 @@ async function fetchKlines(symbol, interval = '1h', limit = 500) {
 }
 
 async function fetchTicker(symbol) {
-  const res = await fetch(`${BINANCE}/api/v3/ticker/price?symbol=${symbol}`);
-  if (!res.ok) throw new Error('ticker error');
-  const d = await res.json();
+  const d = await binanceFetch(`/api/v3/ticker/price?symbol=${symbol}`);
   return parseFloat(d.price);
 }
 
 async function fetch24hStats(symbol) {
-  const res = await fetch(`${BINANCE}/api/v3/ticker/24hr?symbol=${symbol}`);
-  const d = await res.json();
+  const d = await binanceFetch(`/api/v3/ticker/24hr?symbol=${symbol}`);
   return {
     change: parseFloat(d.priceChangePercent),
     high:   parseFloat(d.highPrice),
