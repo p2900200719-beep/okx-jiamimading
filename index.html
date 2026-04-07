@@ -145,8 +145,17 @@ const db = {
     return data || [];
   },
   async insertTrade(trade) {
+    // 先尝试完整写入（含 direction 列）
     const { error } = await supabase.from('crypto_martin_trades').insert(trade);
-    if (error) throw error;
+    if (!error) return;
+    // 如果是 direction 列不存在，降级写入（兼容旧表）
+    if (error.message && error.message.includes('direction')) {
+      const { direction: _omit, ...tradeWithout } = trade;
+      const { error: e2 } = await supabase.from('crypto_martin_trades').insert(tradeWithout);
+      if (e2) throw e2;
+      return;
+    }
+    throw error;
   },
   async deleteTrade(id) {
     const { error } = await supabase.from('crypto_martin_trades').delete().eq('id', id);
@@ -158,7 +167,7 @@ const db = {
 // SQL SETUP HINT (show in console on first load)
 // ─────────────────────────────────────────────
 const SQL_SETUP = `
--- Run in Supabase SQL Editor:
+-- ① 首次建表（全新 Supabase 项目执行此段）
 create table if not exists crypto_martin_users (
   user_code text primary key,
   settings jsonb default '{}',
@@ -177,6 +186,7 @@ create table if not exists crypto_martin_trades (
   id text primary key,
   strategy_id text,
   type text,
+  direction text default 'long',
   price numeric,
   qty numeric,
   usdt numeric,
@@ -184,6 +194,10 @@ create table if not exists crypto_martin_trades (
   executed_at timestamptz default now(),
   note text
 );
+
+-- ② 已有旧表的用户：执行此段补充新列（幂等，可重复执行）
+alter table crypto_martin_trades
+  add column if not exists direction text default 'long';
 `;
 
 // ─────────────────────────────────────────────
@@ -1160,64 +1174,166 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
           </Card>
 
           {/* Tier plan table */}
-          <Card className="overflow-hidden">
-            <div className="p-4 border-b border-slate-100 flex justify-between items-center">
-              <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
-                <Icon name="Target" size={16} className={direction === 'long' ? 'text-emerald-500' : 'text-red-500'}/>
-                {direction === 'long' ? '▲ 做多分档计划（支撑位建仓）' : '▼ 做空分档计划（压力位建仓）'}
-                {leverage > 1 && <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-bold">{leverage}x 杠杆</span>}
-              </span>
-              <div className="text-right">
-                <div className="text-xs text-slate-400">{tiers.length} 档 · {levels.dataInfo}</div>
-              </div>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="bg-slate-50 text-slate-500">
-                    <th className="px-4 py-2 text-left">档位</th>
-                    <th className="px-4 py-2 text-right">目标价</th>
-                    <th className="px-4 py-2 text-right">{direction === 'long' ? '距当前跌幅' : '距当前涨幅'}</th>
-                    <th className="px-4 py-2 text-right">名义金额</th>
-                    {leverage > 1 && <th className="px-4 py-2 text-right text-orange-600">实际保证金</th>}
-                    <th className="px-4 py-2 text-center">量区强度</th>
-                    <th className="px-4 py-2 text-center">操作</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {tiers.length === 0 && (
-                    <tr><td colSpan="6" className="px-4 py-6 text-center text-slate-400">请先获取行情数据</td></tr>
-                  )}
-                  {tiers.map(t => (
-                    <tr key={t.tier} className="hover:bg-slate-50 transition-colors">
-                      <td className="px-4 py-3">
-                        <Badge color={t.tier === 1 ? 'indigo' : t.tier <= 3 ? 'amber' : 'orange'}>T{t.tier}</Badge>
-                      </td>
-                      <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">${parseFloat(t.priceFormatted).toLocaleString('en', {minimumFractionDigits:0, maximumFractionDigits:2})}</td>
-                      <td className={`px-4 py-3 text-right font-semibold ${t.labelColor}`}>{t.label}</td>
-                      <td className="px-4 py-3 text-right font-semibold text-slate-700">${t.amount.toLocaleString()}</td>
-                      {leverage > 1 && <td className="px-4 py-3 text-right font-semibold text-orange-600">${Math.round(t.amount / leverage).toLocaleString()}</td>}
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-1 justify-center">
-                          <div className="w-16 h-2 bg-slate-100 rounded-full overflow-hidden">
-                            <div className={`h-full rounded-full ${direction === 'long' ? 'bg-emerald-500' : 'bg-red-400'}`} style={{ width: `${t.volStrength * 100}%` }}/>
-                          </div>
-                          <span className="text-slate-400">{(t.volStrength * 100).toFixed(0)}%</span>
-                        </div>
-                      </td>
-                      <td className="px-4 py-3 text-center">
-                        <button
-                          className={`text-xs font-semibold ${direction === 'long' ? 'text-emerald-600 hover:text-emerald-800' : 'text-red-500 hover:text-red-700'}`}
-                          onClick={() => { setAddTradeForm(f => ({ ...f, type: direction === 'long' ? 'buy' : 'sell', direction, price: t.price.toFixed(2), usdt: t.amount.toString(), tier: t.tier })); setShowAddTrade(true); }}>
-                          {direction === 'long' ? '买入' : '做空'}
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </Card>
+          {(() => {
+            // ── 预计算每档的：档间距、累计均价、累计保证金 ──
+            let cumQty = 0, cumUsdt = 0;
+            const tiersEnriched = tiers.map((t, i) => {
+              const prev = tiers[i - 1];
+              // 档间距：当前档与上一档的价格距离%
+              const gapPct = prev
+                ? Math.abs((t.price - prev.price) / prev.price * 100)
+                : null;
+              // 累计加权均价：∑(金额) / ∑(数量)
+              const qty = t.amount / t.price;
+              cumQty  += qty;
+              cumUsdt += t.amount;
+              const avgCostSoFar = cumUsdt / cumQty;
+              // 累计保证金
+              const cumMargin = leverage > 1 ? cumUsdt / leverage : cumUsdt;
+              return { ...t, gapPct, avgCostSoFar, cumUsdt, cumMargin, cumQty };
+            });
+            const totalUsdt  = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].cumUsdt  : 0;
+            const totalMargin = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].cumMargin : 0;
+            const totalAvgCost = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].avgCostSoFar : 0;
+            const colCount = 7 + (leverage > 1 ? 1 : 0);
+
+            return (
+              <Card className="overflow-hidden">
+                <div className="p-4 border-b border-slate-100 flex justify-between items-center">
+                  <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
+                    <Icon name="Target" size={16} className={direction === 'long' ? 'text-emerald-500' : 'text-red-500'}/>
+                    {direction === 'long' ? '▲ 做多分档计划（支撑位建仓）' : '▼ 做空分档计划（压力位建仓）'}
+                    {leverage > 1 && <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-bold">{leverage}x 杠杆</span>}
+                  </span>
+                  <div className="text-right">
+                    <div className="text-xs text-slate-400">{tiers.length} 档 · {levels.dataInfo}</div>
+                  </div>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500">
+                        <th className="px-3 py-2.5 text-left">档位</th>
+                        <th className="px-3 py-2.5 text-right">目标价</th>
+                        <th className="px-3 py-2.5 text-right">{direction === 'long' ? '距当前↓' : '距当前↑'}</th>
+                        <th className="px-3 py-2.5 text-right text-slate-400">档间距</th>
+                        <th className="px-3 py-2.5 text-right">名义金额</th>
+                        {leverage > 1 && <th className="px-3 py-2.5 text-right text-orange-500">保证金</th>}
+                        <th className="px-3 py-2.5 text-right text-indigo-500">累计均价</th>
+                        <th className="px-3 py-2.5 text-center">量区</th>
+                        <th className="px-3 py-2.5 text-center">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {tiersEnriched.length === 0 && (
+                        <tr><td colSpan={colCount} className="px-4 py-6 text-center text-slate-400">请先获取行情数据</td></tr>
+                      )}
+                      {tiersEnriched.map((t, i) => (
+                        <tr key={t.tier} className="hover:bg-slate-50 transition-colors">
+                          {/* 档位 badge */}
+                          <td className="px-3 py-3">
+                            <Badge color={t.tier === 1 ? 'indigo' : t.tier <= 3 ? 'amber' : 'orange'}>T{t.tier}</Badge>
+                          </td>
+
+                          {/* 目标价 */}
+                          <td className="px-3 py-3 text-right font-mono font-bold text-slate-700">
+                            ${parseFloat(t.priceFormatted).toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:1})}
+                          </td>
+
+                          {/* 距当前涨跌幅 */}
+                          <td className={`px-3 py-3 text-right font-semibold ${t.labelColor}`}>{t.label}</td>
+
+                          {/* 档间距（T1 显示 —，后续显示与上档的间距） */}
+                          <td className="px-3 py-3 text-right">
+                            {t.gapPct != null
+                              ? <span className="text-slate-400 font-mono">↕{t.gapPct.toFixed(2)}%</span>
+                              : <span className="text-slate-300">首档</span>}
+                          </td>
+
+                          {/* 名义金额 */}
+                          <td className="px-3 py-3 text-right font-semibold text-slate-700">
+                            ${t.amount.toLocaleString()}
+                          </td>
+
+                          {/* 实际保证金（有杠杆才显示） */}
+                          {leverage > 1 && (
+                            <td className="px-3 py-3 text-right font-semibold text-orange-500">
+                              ${Math.round(t.amount / leverage).toLocaleString()}
+                            </td>
+                          )}
+
+                          {/* 累计均价（截至该档全部建仓后的加权均成本） */}
+                          <td className="px-3 py-3 text-right">
+                            <div className="font-bold text-indigo-600 font-mono">
+                              ${t.avgCostSoFar.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:1})}
+                            </div>
+                            <div className="text-slate-400 text-[10px] mt-0.5">
+                              累计 ${t.cumUsdt.toLocaleString()}
+                            </div>
+                          </td>
+
+                          {/* 量区强度 */}
+                          <td className="px-3 py-3">
+                            <div className="flex items-center gap-1 justify-center">
+                              <div className="w-12 h-1.5 bg-slate-100 rounded-full overflow-hidden">
+                                <div className={`h-full rounded-full ${direction === 'long' ? 'bg-emerald-500' : 'bg-red-400'}`}
+                                  style={{ width: `${t.volStrength * 100}%` }}/>
+                              </div>
+                              <span className="text-slate-400 text-[10px]">{(t.volStrength*100).toFixed(0)}%</span>
+                            </div>
+                          </td>
+
+                          {/* 操作 */}
+                          <td className="px-3 py-3 text-center">
+                            <button
+                              className={`text-xs font-semibold px-2 py-1 rounded-md transition-all ${direction === 'long' ? 'text-emerald-600 hover:bg-emerald-50' : 'text-red-500 hover:bg-red-50'}`}
+                              onClick={() => { setAddTradeForm(f => ({ ...f, type: direction === 'long' ? 'buy' : 'sell', direction, price: t.price.toFixed(2), usdt: t.amount.toString(), tier: t.tier })); setShowAddTrade(true); }}>
+                              {direction === 'long' ? '买入' : '做空'}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+
+                    {/* 汇总尾行 */}
+                    {tiersEnriched.length > 0 && (
+                      <tfoot>
+                        <tr className={`border-t-2 font-semibold text-xs ${direction === 'long' ? 'border-emerald-200 bg-emerald-50' : 'border-red-200 bg-red-50'}`}>
+                          <td className="px-3 py-3 text-slate-500" colSpan="2">
+                            全仓建完后
+                          </td>
+                          <td className="px-3 py-3 text-right text-slate-400" colSpan="2">
+                            {tiers.length} 档合计
+                          </td>
+                          <td className="px-3 py-3 text-right text-slate-700">
+                            ${totalUsdt.toLocaleString()}
+                          </td>
+                          {leverage > 1 && (
+                            <td className="px-3 py-3 text-right text-orange-600">
+                              ${Math.round(totalMargin).toLocaleString()}
+                            </td>
+                          )}
+                          <td className="px-3 py-3 text-right">
+                            <div className={`font-black text-sm ${direction === 'long' ? 'text-emerald-700' : 'text-red-600'}`}>
+                              均价 ${totalAvgCost.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:1})}
+                            </div>
+                            <div className="text-[10px] text-slate-400 mt-0.5">
+                              {ticker && direction === 'long'
+                                ? `需涨 ${((ticker/totalAvgCost-1)*100).toFixed(2)}% 回本`
+                                : ticker
+                                  ? `需跌 ${((1-ticker/totalAvgCost)*100).toFixed(2)}% 回本`
+                                  : ''}
+                            </div>
+                          </td>
+                          <td colSpan="2"/>
+                        </tr>
+                      </tfoot>
+                    )}
+                  </table>
+                </div>
+              </Card>
+            );
+          })()}
 
           {/* 24h stats */}
           {stats24h && (
