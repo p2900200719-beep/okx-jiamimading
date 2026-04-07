@@ -235,22 +235,24 @@ async function fetchKlines(symbol, interval = '1h', limit = 500) {
   }));
 }
 
-// 多周期叠加拉取：宏观(日线)+微观(选定周期)，覆盖更宽价格区间
+// VP 周期配置表：每个 vpPeriod 对应独立的K线周期和数量
+// 完全分离，不叠加，支撑/压力位含义明确
+const VP_CONFIGS = {
+  '短线':  { interval: '15m', limit: 672,  label: '短线结构',  desc: '15m × 672根 ≈ 7天',   color: '#8b5cf6' },
+  '日内':  { interval: '1h',  limit: 720,  label: '日内结构',  desc: '1h × 720根 ≈ 30天',   color: '#6366f1' },
+  '中线':  { interval: '4h',  limit: 500,  label: '中线结构',  desc: '4h × 500根 ≈ 83天',   color: '#0ea5e9' },
+  '长线':  { interval: '1d',  limit: 365,  label: '长线结构',  desc: '1d × 365根 ≈ 1年',    color: '#f59e0b' },
+};
+
+// 拉取指定VP周期的K线（单一周期，纯净）
+async function fetchVpKlines(symbol, vpPeriod) {
+  const cfg = VP_CONFIGS[vpPeriod] || VP_CONFIGS['日内'];
+  return fetchKlines(symbol, cfg.interval, cfg.limit);
+}
+
+// 图表K线（用于展示）：固定用选定周期的近200根
 async function fetchMultiKlines(symbol, interval) {
-  // 宏观：日线300根 ≈ 10个月，覆盖主要结构
-  // 微观：选定周期1000根
-  const macroLimit = interval === '1d' ? 500 : 300;
-  const microLimit = interval === '1d' ? 0   : 1000;
-  const promises = [fetchKlines(symbol, '1d', macroLimit)];
-  if (microLimit > 0 && interval !== '1d') {
-    promises.push(fetchKlines(symbol, interval, microLimit));
-  }
-  const results = await Promise.all(promises);
-  // 合并去重（按时间戳）
-  const all = results.flat();
-  const seen = new Set();
-  return all.filter(k => { const key = k.time; if (seen.has(key)) return false; seen.add(key); return true; })
-            .sort((a, b) => a.time - b.time);
+  return fetchKlines(symbol, interval, 200);
 }
 
 async function fetchTicker(symbol) {
@@ -587,14 +589,17 @@ function VolumeProfilePanel({ profile, currentPrice, supports, resistances, poc 
 // ─────────────────────────────────────────────
 function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStatus }) {
   const [activeTab, setActiveTab] = useState('dashboard');
-  const [klines, setKlines] = useState([]);
-  const [ticker, setTicker] = useState(null);
-  const [stats24h, setStats24h] = useState(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
-  const [trades, setTrades] = useState([]);
+  const [klines,    setKlines]    = useState([]);   // 图表K线
+  const [vpKlines,  setVpKlines]  = useState([]);   // VP专用K线（独立周期）
+  const [vpLoading, setVpLoading] = useState(false);
+  const [ticker,    setTicker]    = useState(null);
+  const [stats24h,  setStats24h]  = useState(null);
+  const [loading,   setLoading]   = useState(false);
+  const [error,     setError]     = useState('');
+  const [trades,    setTrades]    = useState([]);
   const [tradesLoaded, setTradesLoaded] = useState(false);
-  const [interval, setIntervalVal] = useState('1h');
+  const [interval,  setIntervalVal] = useState('1h');
+  const [vpPeriod,  setVpPeriod]  = useState('日内'); // VP周期
   const [showAddTrade, setShowAddTrade] = useState(false);
   const [addTradeForm, setAddTradeForm] = useState({ type: 'buy', direction: 'long', price: '', usdt: '', note: '', tier: 1 });
   const [showSqlHint, setShowSqlHint] = useState(false);
@@ -612,7 +617,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const config = strategy.config || {};
   const symbol = strategy.symbol;
 
-  // Load market data
+  // 加载图表K线 + 行情（随图表周期变化）
   const loadMarket = useCallback(async () => {
     setLoading(true); setError('');
     try {
@@ -627,7 +632,19 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
     } finally { setLoading(false); }
   }, [symbol, interval]);
 
+  // 独立加载 VP 专用K线（随 vpPeriod 变化）
+  const loadVpKlines = useCallback(async () => {
+    setVpLoading(true);
+    try {
+      const k = await fetchVpKlines(symbol, vpPeriod);
+      setVpKlines(k);
+    } catch (e) {
+      setError('VP数据加载失败：' + e.message);
+    } finally { setVpLoading(false); }
+  }, [symbol, vpPeriod]);
+
   useEffect(() => { loadMarket(); }, [loadMarket]);
+  useEffect(() => { loadVpKlines(); }, [loadVpKlines]);
 
   // Auto-refresh every 30s
   useEffect(() => {
@@ -646,9 +663,10 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
     })();
   }, [strategy.id]);
 
-  // ---- Volume Profile & Levels ----
-  const profile = useMemo(() => buildVolumeProfile(klines, 80), [klines]);
+  // ---- Volume Profile & Levels（纯净：只用 vpKlines，不混合图表K线）----
+  const profile = useMemo(() => buildVolumeProfile(vpKlines.length ? vpKlines : klines, 80), [vpKlines, klines]);
   const levels  = useMemo(() => detectLevels(profile, ticker || 0, config.minGapPct || 2.0, config.maxTiers || 5), [profile, ticker, config.minGapPct, config.maxTiers]);
+  const vpCfg   = VP_CONFIGS[vpPeriod] || VP_CONFIGS['日内'];
   const longTiers  = useMemo(() => computeLongTiers(levels.supports,    ticker || 0, config), [levels.supports,    ticker, config]);
   const shortTiers = useMemo(() => computeShortTiers(levels.resistances, ticker || 0, config), [levels.resistances, ticker, config]);
   const tiers = direction === 'long' ? longTiers : shortTiers;
@@ -1028,14 +1046,31 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                 </div>
               </div>
             </div>
-            <div className="flex gap-2 flex-wrap">
-              {['15m','1h','4h','1d'].map(iv => (
-                <button key={iv} onClick={() => { setIntervalVal(iv); }}
-                  className={`px-3 py-1 text-xs rounded-full border transition-all ${interval === iv ? 'bg-indigo-600 text-white border-indigo-600' : 'border-slate-200 text-slate-500 hover:border-indigo-300'}`}>{iv}</button>
-              ))}
-              <Btn variant="ghost" onClick={loadMarket} disabled={loading} className="px-2 py-1 text-xs">
-                <Icon name="RefreshCw" size={13} className={loading ? 'animate-spin' : ''}/>刷新
-              </Btn>
+            <div className="flex flex-col gap-2 items-end">
+              {/* 图表K线周期 */}
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                <span className="text-xs text-slate-400">图表：</span>
+                {['15m','1h','4h','1d'].map(iv => (
+                  <button key={iv} onClick={() => setIntervalVal(iv)}
+                    className={`px-2.5 py-1 text-xs rounded-full border transition-all ${interval === iv ? 'bg-slate-600 text-white border-slate-600' : 'border-slate-200 text-slate-400 hover:border-slate-400'}`}>{iv}</button>
+                ))}
+                <button onClick={loadMarket} disabled={loading}
+                  className="text-slate-400 hover:text-slate-600 p-1 rounded-full hover:bg-slate-100 transition-all">
+                  <Icon name="RefreshCw" size={12} className={loading ? 'animate-spin' : ''}/>
+                </button>
+              </div>
+              {/* VP周期（独立，影响支撑/压力位计算） */}
+              <div className="flex items-center gap-1.5 flex-wrap justify-end">
+                <span className="text-xs font-medium" style={{color: vpCfg?.color || '#6366f1'}}>VP周期：</span>
+                {Object.entries(VP_CONFIGS).map(([k, v]) => (
+                  <button key={k} onClick={() => setVpPeriod(k)}
+                    className={`px-2.5 py-1 text-xs rounded-full border font-medium transition-all ${vpPeriod === k ? 'text-white border-transparent' : 'bg-white border-slate-200 text-slate-500 hover:border-opacity-60'}`}
+                    style={vpPeriod === k ? { background: v.color, borderColor: v.color } : {}}>
+                    {k}
+                  </button>
+                ))}
+                {vpLoading && <Icon name="RefreshCw" size={11} className="animate-spin text-slate-400"/>}
+              </div>
             </div>
           </div>
 
@@ -1357,9 +1392,40 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
       {activeTab === 'profile' && (
         <div className="space-y-4">
           <Card className="p-4">
-            <div className="flex justify-between items-center mb-4">
-              <span className="font-semibold text-sm text-slate-700 flex items-center gap-2"><Icon name="BarChart2" size={16} className="text-indigo-500"/>成交量密度分布（Volume Profile）</span>
-              <div className="text-xs text-slate-400">共 {profile.length} 个价格区间</div>
+            <div className="flex justify-between items-center mb-3">
+              <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
+                <Icon name="BarChart2" size={16} className="text-indigo-500"/>
+                Volume Profile
+              </span>
+              <div className="flex items-center gap-2">
+                {Object.entries(VP_CONFIGS).map(([k, v]) => (
+                  <button key={k} onClick={() => setVpPeriod(k)}
+                    className={`px-2.5 py-1 text-xs rounded-full border font-semibold transition-all ${vpPeriod === k ? 'text-white' : 'bg-white text-slate-500 border-slate-200'}`}
+                    style={vpPeriod === k ? {background: v.color, borderColor: v.color} : {}}>
+                    {k}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {/* VP周期说明 */}
+            <div className="flex items-center gap-3 mb-4 p-3 rounded-xl border" style={{borderColor: vpCfg.color + '40', background: vpCfg.color + '10'}}>
+              <span className="w-3 h-3 rounded-full flex-shrink-0" style={{background: vpCfg.color}}/>
+              <div className="text-xs leading-relaxed">
+                <span className="font-bold" style={{color: vpCfg.color}}>{vpCfg.label}</span>
+                <span className="text-slate-500 ml-2">{vpCfg.desc} · {vpKlines.length} 根K线</span>
+                <span className="text-slate-400 ml-2">·</span>
+                <span className="text-slate-500 ml-2">
+                  {vpPeriod === '短线' && '适合日内超短线，对应分钟级波段的关键成交密集区'}
+                  {vpPeriod === '日内' && '适合日内~短线，对应近1个月内的主要交易密集区'}
+                  {vpPeriod === '中线' && '适合中线波段，对应近3个月的核心筹码分布'}
+                  {vpPeriod === '长线' && '适合趋势级别，对应年度主力筹码沉淀的关键价格区'}
+                </span>
+              </div>
+              {vpLoading && <Icon name="RefreshCw" size={13} className="animate-spin text-slate-400 flex-shrink-0"/>}
+            </div>
+            <div className="flex justify-between items-center mb-2">
+              <span className="text-xs text-slate-400">共 {profile.length} 个价格区间</span>
+              <span className="text-xs text-slate-400">{levels.dataInfo}</span>
             </div>
             {loading ? (
               <div className="flex justify-center py-8 text-slate-400"><Icon name="RefreshCw" size={20} className="animate-spin"/></div>
@@ -1376,7 +1442,11 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
           {/* Levels detail */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <Card className="p-4">
-              <div className="font-semibold text-sm text-emerald-700 mb-3 flex items-center gap-2"><Icon name="TrendingDown" size={15}/>支撑位列表</div>
+              <div className="font-semibold text-sm text-emerald-700 mb-1 flex items-center gap-2"><Icon name="TrendingDown" size={15}/>支撑位列表</div>
+              <div className="text-xs text-slate-400 mb-3 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full" style={{background: vpCfg.color}}/>
+                基于{vpCfg.label}（{vpCfg.desc}）
+              </div>
               <div className="space-y-2">
                 {levels.supports.slice(0,8).map((s, i) => (
                   <div key={i} className="flex items-center justify-between text-xs">
@@ -1390,7 +1460,11 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
               </div>
             </Card>
             <Card className="p-4">
-              <div className="font-semibold text-sm text-red-600 mb-3 flex items-center gap-2"><Icon name="TrendingUp" size={15}/>压力位列表</div>
+              <div className="font-semibold text-sm text-red-600 mb-1 flex items-center gap-2"><Icon name="TrendingUp" size={15}/>压力位列表</div>
+              <div className="text-xs text-slate-400 mb-3 flex items-center gap-1">
+                <span className="w-2 h-2 rounded-full" style={{background: vpCfg.color}}/>
+                基于{vpCfg.label}（{vpCfg.desc}）
+              </div>
               <div className="space-y-2">
                 {levels.resistances.slice(0,8).map((r, i) => (
                   <div key={i} className="flex items-center justify-between text-xs">
