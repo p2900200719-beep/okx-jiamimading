@@ -221,6 +221,24 @@ async function fetchKlines(symbol, interval = '1h', limit = 500) {
   }));
 }
 
+// 多周期叠加拉取：宏观(日线)+微观(选定周期)，覆盖更宽价格区间
+async function fetchMultiKlines(symbol, interval) {
+  // 宏观：日线300根 ≈ 10个月，覆盖主要结构
+  // 微观：选定周期1000根
+  const macroLimit = interval === '1d' ? 500 : 300;
+  const microLimit = interval === '1d' ? 0   : 1000;
+  const promises = [fetchKlines(symbol, '1d', macroLimit)];
+  if (microLimit > 0 && interval !== '1d') {
+    promises.push(fetchKlines(symbol, interval, microLimit));
+  }
+  const results = await Promise.all(promises);
+  // 合并去重（按时间戳）
+  const all = results.flat();
+  const seen = new Set();
+  return all.filter(k => { const key = k.time; if (seen.has(key)) return false; seen.add(key); return true; })
+            .sort((a, b) => a.time - b.time);
+}
+
 async function fetchTicker(symbol) {
   const d = await binanceFetch(`/api/v3/ticker/price?symbol=${symbol}`);
   return parseFloat(d.price);
@@ -239,7 +257,7 @@ async function fetch24hStats(symbol) {
 // ─────────────────────────────────────────────
 // VOLUME PROFILE ENGINE
 // ─────────────────────────────────────────────
-function buildVolumeProfile(klines, bins = 40) {
+function buildVolumeProfile(klines, bins = 60) {
   if (!klines.length) return [];
   const minP = Math.min(...klines.map(k => k.low));
   const maxP = Math.max(...klines.map(k => k.high));
@@ -251,38 +269,31 @@ function buildVolumeProfile(klines, bins = 40) {
     volume: 0,
   }));
   klines.forEach(k => {
-    const midPrice = (k.high + k.low) / 2;
-    const idx = Math.min(Math.floor((midPrice - minP) / step), bins - 1);
-    if (idx >= 0) buckets[idx].volume += k.volume;
+    // 按K线的高低价区间均匀分配成交量（更精准）
+    const lo = k.low, hi = k.high, vol = k.volume;
+    const iLo = Math.max(0, Math.floor((lo - minP) / step));
+    const iHi = Math.min(bins - 1, Math.floor((hi - minP) / step));
+    const span = iHi - iLo + 1;
+    for (let i = iLo; i <= iHi; i++) buckets[i].volume += vol / span;
   });
   const maxVol = Math.max(...buckets.map(b => b.volume));
   return buckets.map(b => ({ ...b, volPct: maxVol > 0 ? b.volume / maxVol : 0 }));
 }
 
-function detectLevels(profile, currentPrice, minGapPct = 1.5) {
-  if (!profile.length) return { supports: [], resistances: [], poc: null, hvns: [], allSupports: [], allResistances: [] };
+function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
+  if (!profile.length) return { supports: [], resistances: [], poc: null, hvns: [], allSupports: [], allResistances: [], dataInfo: '' };
 
-  // POC = highest volume bucket
   const sorted = [...profile].sort((a, b) => b.volume - a.volume);
   const poc = sorted[0];
 
-  // HVN: top 25% by volume (更严格，减少噪音)
-  const threshold = sorted[Math.floor(sorted.length * 0.25)].volume;
-  const hvns = profile.filter(b => b.volume >= threshold);
-
-  // 按价格排序
-  const allSupports    = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
-  const allResistances = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
-
-  // 去密：相邻档位间距必须 >= minGapPct%，保留量能更强的那个
-  function dedupe(levels, refPrice) {
+  // 去密函数：相邻间距 < minGapPct 时合并，保留量能更强的
+  function dedupe(levels, refPrice, gapPct) {
     const result = [];
     for (const lv of levels) {
       const last = result[result.length - 1];
       if (!last) { result.push(lv); continue; }
       const gap = Math.abs(lv.priceMid - last.priceMid) / refPrice * 100;
-      if (gap < minGapPct) {
-        // 合并：保留量能更强的
+      if (gap < gapPct) {
         if (lv.volume > last.volume) result[result.length - 1] = lv;
       } else {
         result.push(lv);
@@ -291,10 +302,42 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5) {
     return result;
   }
 
-  const supports    = dedupe(allSupports,    currentPrice);
-  const resistances = dedupe(allResistances, currentPrice);
+  // 动态 HVN 阈值：从严到宽自动放开，直到两侧各有 minLevels 个档位
+  // pctile: 0.15 → top15%, 0.25 → top25%, 0.35 → top35%, 0.50 → top50%
+  const pctiles = [0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 1.0];
+  let supports = [], resistances = [], usedPctile = 0.15, usedGap = minGapPct;
 
-  return { supports, resistances, poc, hvns, allSupports, allResistances };
+  for (const pct of pctiles) {
+    const threshold = sorted[Math.min(Math.floor(sorted.length * pct), sorted.length - 1)].volume;
+    const hvns = profile.filter(b => b.volume >= threshold);
+    const rawSup = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
+    const rawRes = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
+
+    // 档位不足时逐步降低间距要求（从 minGapPct 一直降到 0.5%）
+    let bestSup = [], bestRes = [], bestGap = minGapPct;
+    for (const gap of [minGapPct, minGapPct * 0.7, minGapPct * 0.5, 0.5]) {
+      const s = dedupe(rawSup, currentPrice, gap);
+      const r = dedupe(rawRes, currentPrice, gap);
+      bestSup = s; bestRes = r; bestGap = gap;
+      if (s.length >= minLevels && r.length >= minLevels) break;
+    }
+
+    supports    = bestSup;
+    resistances = bestRes;
+    usedPctile  = pct;
+    usedGap     = bestGap;
+
+    // 两侧都够档位就停止放宽
+    if (supports.length >= minLevels && resistances.length >= minLevels) break;
+  }
+
+  const allSupports    = supports;
+  const allResistances = resistances;
+  const hvns = [...supports, ...resistances];
+
+  const dataInfo = `HVN阈值 top${(usedPctile*100).toFixed(0)}% · 间距≥${usedGap.toFixed(1)}% · 支撑${supports.length}个/压力${resistances.length}个`;
+
+  return { supports, resistances, poc, hvns, allSupports, allResistances, dataInfo };
 }
 
 // 做多分档：支撑位往下买
@@ -540,6 +583,8 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const [showSqlHint, setShowSqlHint] = useState(false);
   // 策略方向: 'long' | 'short'
   const [direction, setDirection] = useState(() => (strategy.config?.direction || 'long'));
+  // 杠杆倍数 (1 = 现货/无杠杆)
+  const [leverage, setLeverage] = useState(() => (strategy.config?.leverage || 1));
 
   const config = strategy.config || {};
   const symbol = strategy.symbol;
@@ -549,7 +594,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
     setLoading(true); setError('');
     try {
       const [k, t, s] = await Promise.all([
-        fetchKlines(symbol, interval, 300),
+        fetchMultiKlines(symbol, interval),
         fetchTicker(symbol),
         fetch24hStats(symbol),
       ]);
@@ -579,8 +624,8 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   }, [strategy.id]);
 
   // ---- Volume Profile & Levels ----
-  const profile = useMemo(() => buildVolumeProfile(klines, 50), [klines]);
-  const levels  = useMemo(() => detectLevels(profile, ticker || 0, config.minGapPct || 2.0), [profile, ticker, config.minGapPct]);
+  const profile = useMemo(() => buildVolumeProfile(klines, 80), [klines]);
+  const levels  = useMemo(() => detectLevels(profile, ticker || 0, config.minGapPct || 2.0, config.maxTiers || 5), [profile, ticker, config.minGapPct, config.maxTiers]);
   const longTiers  = useMemo(() => computeLongTiers(levels.supports,    ticker || 0, config), [levels.supports,    ticker, config]);
   const shortTiers = useMemo(() => computeShortTiers(levels.resistances, ticker || 0, config), [levels.resistances, ticker, config]);
   const tiers = direction === 'long' ? longTiers : shortTiers;
@@ -627,8 +672,15 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
       ? (avgCost - ticker) * holdQty   // 做空：开仓价 > 当前价 = 盈
       : mktValue - holdUsdt;           // 做多：当前价 > 成本 = 盈
     const usedCapital = (holdUsdt / (config.totalCapital || 1)) * 100;
-    return { holdQty, avgCost, mktValue, holdUsdt, realizedPnl: realized, unrealizedPnl, usedCapital, isShort };
-  }, [trades, ticker, config, direction]);
+    // 强平价估算（简化公式，仅供参考，实际以交易所为准）
+    // 做多强平价 ≈ avgCost × (1 - 1/leverage + maintenanceMargin/leverage)
+    const mm = 0.005; // 维持保证金率 0.5%（保守估计）
+    const lev = leverage || 1;
+    const liqPrice = isShort
+      ? (holdQty > 0 ? avgCost * (1 + 1/lev - mm/lev) : null)
+      : (holdQty > 0 ? avgCost * (1 - 1/lev + mm/lev) : null);
+    return { holdQty, avgCost, mktValue, holdUsdt, realizedPnl: realized, unrealizedPnl, usedCapital, isShort, liqPrice };
+  }, [trades, ticker, config, direction, leverage]);
 
   // ---- Add trade ----
   const handleAddTrade = async () => {
@@ -768,22 +820,34 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
             </div>
           </div>
 
-          {/* 方向切换 */}
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-500 font-medium">策略方向：</span>
+          {/* 方向 & 杠杆控制行 */}
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-xs text-slate-500 font-medium">方向：</span>
             <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
               <button onClick={() => setDirection('long')}
-                className={`px-4 py-2 transition-all flex items-center gap-1.5 ${direction === 'long' ? 'bg-emerald-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
+                className={`px-4 py-2 transition-all ${direction === 'long' ? 'bg-emerald-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
                 ▲ 做多
               </button>
               <button onClick={() => setDirection('short')}
-                className={`px-4 py-2 transition-all flex items-center gap-1.5 border-l border-slate-200 ${direction === 'short' ? 'bg-red-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
+                className={`px-4 py-2 transition-all border-l border-slate-200 ${direction === 'short' ? 'bg-red-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
                 ▼ 做空
               </button>
             </div>
-            <span className={`text-xs px-2 py-1 rounded-full font-medium ${direction === 'long' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
-              {direction === 'long' ? '在支撑位分批建多仓' : '在压力位分批建空仓'}
-            </span>
+            <span className="text-xs text-slate-300">|</span>
+            <span className="text-xs text-slate-500 font-medium">杠杆：</span>
+            <div className="flex gap-1">
+              {[1,2,3,5,10,20].map(lv => (
+                <button key={lv} onClick={() => setLeverage(lv)}
+                  className={`px-2.5 py-1.5 text-xs rounded-lg border font-bold transition-all ${leverage === lv ? (lv >= 10 ? 'bg-red-500 text-white border-red-500' : lv >= 5 ? 'bg-orange-500 text-white border-orange-500' : 'bg-indigo-600 text-white border-indigo-600') : 'border-slate-200 text-slate-500 hover:border-indigo-300'}`}>
+                  {lv === 1 ? '现货' : `${lv}x`}
+                </button>
+              ))}
+            </div>
+            {leverage > 1 && (
+              <span className={`text-xs px-2 py-1 rounded-full font-semibold ${leverage >= 10 ? 'bg-red-50 text-red-700' : 'bg-orange-50 text-orange-700'}`}>
+                保证金率 {(100/leverage).toFixed(1)}% {leverage >= 10 ? '⚠ 高风险' : ''}
+              </span>
+            )}
           </div>
 
           {error && (
@@ -842,6 +906,20 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                   );
                 })}
               </div>
+              {portfolioStats.liqPrice && leverage > 1 && (
+                <div className="mt-2 flex items-center gap-2 text-xs">
+                  <span className="text-slate-400">预估强平价：</span>
+                  <span className="font-bold text-orange-500">${portfolioStats.liqPrice.toFixed(2)}</span>
+                  <span className="text-slate-300">·</span>
+                  <span className="text-slate-400">距当前</span>
+                  <span className={`font-semibold ${Math.abs((portfolioStats.liqPrice - ticker)/ticker) < 0.05 ? 'text-red-600 animate-pulse' : 'text-slate-600'}`}>
+                    {((portfolioStats.liqPrice - ticker)/ticker * 100).toFixed(2)}%
+                  </span>
+                  {Math.abs((portfolioStats.liqPrice - ticker)/ticker) < 0.05 && (
+                    <span className="bg-red-100 text-red-700 px-2 py-0.5 rounded-full font-bold animate-pulse">⚠ 接近强平！</span>
+                  )}
+                </div>
+              )}
             </div>
           )}
 
@@ -882,8 +960,11 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
               <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
                 <Icon name="Target" size={16} className={direction === 'long' ? 'text-emerald-500' : 'text-red-500'}/>
                 {direction === 'long' ? '▲ 做多分档计划（支撑位建仓）' : '▼ 做空分档计划（压力位建仓）'}
+                {leverage > 1 && <span className="text-xs bg-orange-100 text-orange-700 px-2 py-0.5 rounded-full font-bold">{leverage}x 杠杆</span>}
               </span>
-              <span className="text-xs text-slate-400">{tiers.length} 个关键位 · 去密后</span>
+              <div className="text-right">
+                <div className="text-xs text-slate-400">{tiers.length} 档 · {levels.dataInfo}</div>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
@@ -892,7 +973,8 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                     <th className="px-4 py-2 text-left">档位</th>
                     <th className="px-4 py-2 text-right">目标价</th>
                     <th className="px-4 py-2 text-right">{direction === 'long' ? '距当前跌幅' : '距当前涨幅'}</th>
-                    <th className="px-4 py-2 text-right">建议金额</th>
+                    <th className="px-4 py-2 text-right">名义金额</th>
+                    {leverage > 1 && <th className="px-4 py-2 text-right text-orange-600">实际保证金</th>}
                     <th className="px-4 py-2 text-center">量区强度</th>
                     <th className="px-4 py-2 text-center">操作</th>
                   </tr>
@@ -909,6 +991,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                       <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">${parseFloat(t.priceFormatted).toLocaleString('en', {minimumFractionDigits:0, maximumFractionDigits:2})}</td>
                       <td className={`px-4 py-3 text-right font-semibold ${t.labelColor}`}>{t.label}</td>
                       <td className="px-4 py-3 text-right font-semibold text-slate-700">${t.amount.toLocaleString()}</td>
+                      {leverage > 1 && <td className="px-4 py-3 text-right font-semibold text-orange-600">${Math.round(t.amount / leverage).toLocaleString()}</td>}
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1 justify-center">
                           <div className="w-16 h-2 bg-slate-100 rounded-full overflow-hidden">
@@ -1150,8 +1233,23 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                 <Field label="备注" value={addTradeForm.note} onChange={v => setAddTradeForm(f => ({ ...f, note: v }))} placeholder="可选" />
               </div>
               {addTradeForm.price && addTradeForm.usdt && (
-                <div className="bg-slate-50 rounded-lg p-2 text-xs text-slate-500 text-center">
-                  数量：{(parseFloat(addTradeForm.usdt) / parseFloat(addTradeForm.price)).toFixed(5)} {symbol.replace('USDT', '')}
+                <div className="bg-slate-50 rounded-lg p-3 text-xs text-slate-600 space-y-1">
+                  <div className="flex justify-between">
+                    <span className="text-slate-400">合约数量</span>
+                    <span className="font-mono font-semibold">{(parseFloat(addTradeForm.usdt) / parseFloat(addTradeForm.price)).toFixed(5)} {symbol.replace('USDT', '')}</span>
+                  </div>
+                  {leverage > 1 && (
+                    <>
+                      <div className="flex justify-between">
+                        <span className="text-slate-400">名义价值</span>
+                        <span className="font-mono">${parseFloat(addTradeForm.usdt).toLocaleString()}</span>
+                      </div>
+                      <div className="flex justify-between border-t border-slate-200 pt-1 mt-1">
+                        <span className="text-orange-600 font-medium">实际保证金 ({leverage}x)</span>
+                        <span className="font-mono font-bold text-orange-600">${(parseFloat(addTradeForm.usdt) / leverage).toFixed(2)}</span>
+                      </div>
+                    </>
+                  )}
                 </div>
               )}
               <div className="flex gap-2 mt-2">
@@ -1173,7 +1271,7 @@ function StrategyList({ userCode, onSelect }) {
   const [strategies, setStrategies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ symbol: 'BTCUSDT', totalCapital: '10000', maxTiers: '5', tierMultiplier: '1.5', direction: 'long', minGapPct: '2.0' });
+  const [form, setForm] = useState({ symbol: 'BTCUSDT', totalCapital: '10000', maxTiers: '5', tierMultiplier: '1.5', direction: 'long', minGapPct: '2.0', leverage: '1' });
 
   useEffect(() => {
     (async () => {
@@ -1196,6 +1294,7 @@ function StrategyList({ userCode, onSelect }) {
         tierMultiplier: parseFloat(form.tierMultiplier) || 1.5,
         direction:      form.direction || 'long',
         minGapPct:      parseFloat(form.minGapPct) || 2.0,
+        leverage:       parseInt(form.leverage) || 1,
       },
       status: 'active',
     };
@@ -1243,7 +1342,7 @@ function StrategyList({ userCode, onSelect }) {
                 </div>
                 <div>
                   <div className="font-bold text-slate-800">{s.symbol}</div>
-                  <div className="text-xs text-slate-400">${(s.config?.totalCapital || 0).toLocaleString()} · {s.config?.maxTiers || 5}档 · <span className={s.config?.direction === 'short' ? 'text-red-500' : 'text-emerald-600'}>{s.config?.direction === 'short' ? '▼空' : '▲多'}</span></div>
+                  <div className="text-xs text-slate-400">${(s.config?.totalCapital || 0).toLocaleString()} · {s.config?.maxTiers || 5}档 · <span className={s.config?.direction === 'short' ? 'text-red-500' : 'text-emerald-600'}>{s.config?.direction === 'short' ? '▼空' : '▲多'}</span>{(s.config?.leverage||1) > 1 && <span className="text-orange-500 ml-1">{s.config.leverage}x</span>}</div>
                 </div>
               </div>
               <button onClick={e => handleDelete(e, s.id)} className="text-slate-200 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100">
@@ -1293,9 +1392,25 @@ function StrategyList({ userCode, onSelect }) {
                 <Field label="档位倍数" value={form.tierMultiplier} onChange={v => setForm(f => ({ ...f, tierMultiplier: v }))} type="number" suffix="x" />
               </div>
               <Field label="档位最小间距 (% 去密)" value={form.minGapPct} onChange={v => setForm(f => ({ ...f, minGapPct: v }))} type="number" suffix="%" />
+              <div>
+                <label className="text-xs font-medium text-slate-500 block mb-2">杠杆倍数</label>
+                <div className="flex gap-2 flex-wrap">
+                  {[1,2,3,5,10,20].map(lv => (
+                    <button key={lv} onClick={() => setForm(f => ({ ...f, leverage: String(lv) }))}
+                      className={`px-3 py-2 text-xs rounded-lg border font-bold transition-all flex-1 ${String(form.leverage) === String(lv) ? (lv >= 10 ? 'bg-red-500 text-white border-red-500' : lv >= 5 ? 'bg-orange-500 text-white border-orange-500' : 'bg-indigo-600 text-white border-indigo-600') : 'border-slate-200 text-slate-500'}`}>
+                      {lv === 1 ? '现货
+1x' : `合约
+${lv}x`}
+                    </button>
+                  ))}
+                </div>
+                {parseInt(form.leverage) > 1 && (
+                  <p className="text-xs text-orange-600 mt-1.5">⚠ {form.leverage}x 杠杆：保证金率 {(100/parseInt(form.leverage)).toFixed(1)}%，请控制仓位风险</p>
+                )}
+              </div>
               <div className="text-xs text-slate-400 bg-slate-50 rounded-lg p-3 leading-relaxed">
                 <b>档位倍数</b>：递增系数，例如1.5 → 首档$1000、次档$1500……<br/>
-                <b>最小间距</b>：过滤掉相邻太近的量价节点，建议2%~5%，避免分档过密。<br/>
+                <b>最小间距</b>：建议2%~5%，系统会自动放宽确保档位数量足够。<br/>
                 <b>做空</b>：在压力位分批开空，在支撑位止盈平仓。
               </div>
               <div className="flex gap-2">
