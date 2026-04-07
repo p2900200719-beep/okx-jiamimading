@@ -302,7 +302,7 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
   const sorted = [...profile].sort((a, b) => b.volume - a.volume);
   const poc = sorted[0];
 
-  // 去密函数：相邻间距 < minGapPct 时合并，保留量能更强的
+  // 去密函数：相邻间距 < gapPct 时合并，保留量能更强的
   function dedupe(levels, refPrice, gapPct) {
     const result = [];
     for (const lv of levels) {
@@ -310,6 +310,7 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
       if (!last) { result.push(lv); continue; }
       const gap = Math.abs(lv.priceMid - last.priceMid) / refPrice * 100;
       if (gap < gapPct) {
+        // 间距不足：两个节点合并，保留量能更强的那个
         if (lv.volume > last.volume) result[result.length - 1] = lv;
       } else {
         result.push(lv);
@@ -318,40 +319,48 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
     return result;
   }
 
-  // 动态 HVN 阈值：从严到宽自动放开，直到两侧各有 minLevels 个档位
-  // pctile: 0.15 → top15%, 0.25 → top25%, 0.35 → top35%, 0.50 → top50%
-  const pctiles = [0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 1.0];
+  // ─── 修复后的搜索逻辑 ───────────────────────────────────────
+  // 策略：先用用户设定的间距(minGapPct)，逐步放宽HVN阈值(pctile)直到档位够用。
+  //       只有在所有阈值都放宽完还不够档位时，才降低间距要求。
+  //       这样间距始终尽量贴近用户设置，不会自动缩水到0.5%。
+
+  const pctiles  = [0.15, 0.22, 0.30, 0.40, 0.50, 0.62, 0.75, 1.0];
+  // 间距降级序列：只在所有pctile都不够时才逐步降低
+  const gapFallbacks = [minGapPct, minGapPct * 0.75, minGapPct * 0.5, Math.max(minGapPct * 0.3, 0.3)];
+
   let supports = [], resistances = [], usedPctile = 0.15, usedGap = minGapPct;
+  let found = false;
 
-  for (const pct of pctiles) {
-    const threshold = sorted[Math.min(Math.floor(sorted.length * pct), sorted.length - 1)].volume;
-    const hvns = profile.filter(b => b.volume >= threshold);
-    const rawSup = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
-    const rawRes = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
+  for (const gap of gapFallbacks) {
+    for (const pct of pctiles) {
+      const threshold = sorted[Math.min(Math.floor(sorted.length * pct), sorted.length - 1)].volume;
+      const hvns   = profile.filter(b => b.volume >= threshold);
+      const rawSup = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
+      const rawRes = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
 
-    // 档位不足时逐步降低间距要求（从 minGapPct 一直降到 0.5%）
-    let bestSup = [], bestRes = [], bestGap = minGapPct;
-    for (const gap of [minGapPct, minGapPct * 0.7, minGapPct * 0.5, 0.5]) {
       const s = dedupe(rawSup, currentPrice, gap);
       const r = dedupe(rawRes, currentPrice, gap);
-      bestSup = s; bestRes = r; bestGap = gap;
-      if (s.length >= minLevels && r.length >= minLevels) break;
+
+      // 记录当前最好结果（更多档位优先）
+      if (s.length + r.length > supports.length + resistances.length) {
+        supports = s; resistances = r; usedPctile = pct; usedGap = gap;
+      }
+
+      // 两侧都达到目标档位数，立即停止
+      if (s.length >= minLevels && r.length >= minLevels) { found = true; break; }
     }
-
-    supports    = bestSup;
-    resistances = bestRes;
-    usedPctile  = pct;
-    usedGap     = bestGap;
-
-    // 两侧都够档位就停止放宽
-    if (supports.length >= minLevels && resistances.length >= minLevels) break;
+    if (found) break;
+    // 当前间距跑完所有pctile仍不够档位，才降低间距继续
   }
 
   const allSupports    = supports;
   const allResistances = resistances;
   const hvns = [...supports, ...resistances];
 
-  const dataInfo = `HVN阈值 top${(usedPctile*100).toFixed(0)}% · 间距≥${usedGap.toFixed(1)}% · 支撑${supports.length}个/压力${resistances.length}个`;
+  const gapNote = usedGap < minGapPct
+    ? `间距≥${usedGap.toFixed(1)}%(已降级)`
+    : `间距≥${usedGap.toFixed(1)}%`;
+  const dataInfo = `HVN top${(usedPctile*100).toFixed(0)}% · ${gapNote} · 支撑${supports.length}/压力${resistances.length}`;
 
   return { supports, resistances, poc, hvns, allSupports, allResistances, dataInfo };
 }
