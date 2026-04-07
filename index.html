@@ -420,6 +420,9 @@ const Icon = ({ name, size = 16, className = '' }) => {
     Moon: <><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></>,
     Sun: <><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></>,
     Copy: <><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></>,
+    Brain: <><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></>,
+    ArrowLeft: <><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></>,
+    Sparkles: <><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></>,
   };
   return (
     <svg xmlns="http://www.w3.org/2000/svg" width={size} height={size} viewBox="0 0 24 24" fill="none"
@@ -581,6 +584,12 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const [showAddTrade, setShowAddTrade] = useState(false);
   const [addTradeForm, setAddTradeForm] = useState({ type: 'buy', direction: 'long', price: '', usdt: '', note: '', tier: 1 });
   const [showSqlHint, setShowSqlHint] = useState(false);
+  // ── AI 回测优化 state ──
+  const [aiRunning,    setAiRunning]    = useState(false);
+  const [aiProgress,   setAiProgress]   = useState(0);      // 0-100
+  const [aiResult,     setAiResult]     = useState(null);   // 优化结果
+  const [aiRange,      setAiRange]      = useState('3m');   // 回测区间
+  const [aiApplied,    setAiApplied]    = useState(false);  // 是否已应用
   // 策略方向: 'long' | 'short'
   const [direction, setDirection] = useState(() => (strategy.config?.direction || 'long'));
   // 杠杆倍数 (1 = 现货/无杠杆)
@@ -765,6 +774,201 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
     return null;
   }, [ticker, tiers, levels, portfolioStats, direction]);
 
+  // ══════════════════════════════════════════════════════
+  // AI 回测引擎
+  // ══════════════════════════════════════════════════════
+
+  // 单次参数组合回测
+  // 模拟马丁策略在历史K线上的表现
+  const runBacktest = useCallback((backtestKlines, params) => {
+    const { maxTiers, tierMultiplier, minGapPct, dir } = params;
+    const capital = config.totalCapital || 10000;
+    const isShort = dir === 'short';
+
+    let cash = capital;
+    let position = 0;   // 持仓量
+    let costBasis = 0;  // 持仓成本总额
+    let realized = 0;
+    let maxDrawdown = 0;
+    let peakValue = capital;
+    let trades = 0;
+    let wins = 0;
+
+    // 用前60%的K线建VP，在后40%上模拟交易（避免未来函数）
+    const splitIdx = Math.floor(backtestKlines.length * 0.6);
+    const vpKlines  = backtestKlines.slice(0, splitIdx);
+    const simKlines = backtestKlines.slice(splitIdx);
+
+    if (vpKlines.length < 20 || simKlines.length < 10) return null;
+
+    // 建立 Volume Profile
+    const prof = buildVolumeProfile(vpKlines, 60);
+    const firstClose = simKlines[0].close;
+    const lvls = detectLevels(prof, firstClose, minGapPct, maxTiers);
+    const levels = isShort ? lvls.resistances : lvls.supports;
+
+    if (levels.length < 2) return null;
+
+    // 计算每档价格
+    const capitalPerTier = capital / maxTiers;
+    const tierPrices = levels.slice(0, maxTiers).map((lv, i) => ({
+      price: lv.priceMid,
+      amount: Math.min(capitalPerTier * (1 + i * (tierMultiplier - 1)), capital * 0.4),
+      triggered: false,
+    }));
+
+    // 止盈目标：做多→回到第一个压力位，做空→回到第一个支撑位
+    const tpLevel = isShort ? lvls.supports[0] : lvls.resistances[0];
+    const tpPrice = tpLevel ? tpLevel.priceMid : null;
+
+    // 模拟逐K线
+    for (const k of simKlines) {
+      const price = k.close;
+      const totalValue = cash + (isShort
+        ? realized + (position > 0 ? (costBasis/position - price) * position : 0)
+        : position * price + cash);
+
+      // 计算回撤
+      if (totalValue > peakValue) peakValue = totalValue;
+      const dd = (peakValue - totalValue) / peakValue;
+      if (dd > maxDrawdown) maxDrawdown = dd;
+
+      // 熔断：回撤超60%停止
+      if (maxDrawdown > 0.6) break;
+
+      // 检查买入/开空触发（做多：低于档位价 / 做空：高于档位价）
+      for (const tier of tierPrices) {
+        if (tier.triggered) continue;
+        const triggered = isShort ? price >= tier.price : price <= tier.price;
+        if (triggered && cash >= tier.amount) {
+          const qty = tier.amount / price;
+          if (isShort) {
+            // 开空：记录开仓
+            position  += qty;
+            costBasis += tier.amount;
+          } else {
+            // 做多：买入
+            position  += qty;
+            costBasis += tier.amount;
+            cash      -= tier.amount;
+          }
+          tier.triggered = true;
+          trades++;
+        }
+      }
+
+      // 检查止盈
+      if (position > 0 && tpPrice) {
+        const tpTriggered = isShort ? price <= tpPrice : price >= tpPrice;
+        if (tpTriggered) {
+          if (isShort) {
+            const avgOpen = costBasis / position;
+            realized += (avgOpen - price) * position;
+          } else {
+            realized += position * price - costBasis;
+            cash     += position * price;
+          }
+          if (realized > 0) wins++;
+          // 重置
+          position = 0; costBasis = 0;
+          // 重置档位触发状态
+          tierPrices.forEach(t => t.triggered = false);
+          trades++;
+        }
+      }
+    }
+
+    // 最终清算（按最后收盘价）
+    const lastPrice = simKlines[simKlines.length - 1].close;
+    let finalPnl = realized;
+    if (position > 0) {
+      if (isShort) finalPnl += (costBasis / position - lastPrice) * position;
+      else         finalPnl += position * lastPrice - costBasis;
+    }
+
+    const roi = (finalPnl / capital) * 100;
+    const winRate = trades > 0 ? (wins / Math.max(trades/2, 1)) * 100 : 0;
+    const score = roi - maxDrawdown * 50; // 综合评分：收益 - 回撤惩罚
+
+    return { roi, finalPnl, maxDrawdown: maxDrawdown * 100, trades, winRate, score, params };
+  }, [config, direction]);
+
+  // AI 参数搜索主函数
+  const runAiOptimize = useCallback(async () => {
+    if (klines.length < 50) { alert('数据不足，请先刷新行情'); return; }
+    setAiRunning(true); setAiProgress(0); setAiResult(null); setAiApplied(false);
+
+    // 选取回测数据
+    const now = Date.now();
+    const rangeMs = { '1m': 30, '3m': 90, '6m': 180, '1y': 365 };
+    const days = rangeMs[aiRange] || 90;
+    const cutoff = now - days * 86400000;
+    const btKlines = klines.filter(k => k.time >= cutoff);
+    if (btKlines.length < 30) { alert('所选时段数据不足，请切换更大时间周期或延长回测区间'); setAiRunning(false); return; }
+
+    // 参数搜索空间
+    const maxTiersCandidates   = [3, 4, 5, 6, 7];
+    const tierMultCandidates   = [1.0, 1.3, 1.5, 1.8, 2.0, 2.5];
+    const minGapCandidates     = [0.8, 1.2, 1.8, 2.5, 3.5];
+    const dirCandidates        = ['long', 'short'];
+
+    const total = maxTiersCandidates.length * tierMultCandidates.length * minGapCandidates.length * dirCandidates.length;
+    let done = 0;
+    const results = [];
+
+    // 分批执行，每批后让 UI 刷新
+    const batches = [];
+    for (const dir of dirCandidates)
+      for (const maxTiers of maxTiersCandidates)
+        for (const tierMultiplier of tierMultCandidates)
+          for (const minGapPct of minGapCandidates)
+            batches.push({ dir, maxTiers, tierMultiplier, minGapPct });
+
+    const batchSize = 10;
+    for (let i = 0; i < batches.length; i += batchSize) {
+      const chunk = batches.slice(i, i + batchSize);
+      await new Promise(resolve => setTimeout(resolve, 0)); // yield to UI
+      for (const params of chunk) {
+        const r = runBacktest(btKlines, params);
+        if (r && isFinite(r.score)) results.push(r);
+        done++;
+      }
+      setAiProgress(Math.round((done / total) * 100));
+    }
+
+    if (!results.length) { alert('回测无有效结果，请检查数据'); setAiRunning(false); return; }
+
+    // 排序：综合评分最高
+    results.sort((a, b) => b.score - a.score);
+    const top10 = results.slice(0, 10);
+    const best  = results[0];
+
+    setAiResult({ best, top10, total, btKlines, btDays: days });
+    setAiRunning(false);
+    setAiProgress(100);
+  }, [klines, aiRange, runBacktest]);
+
+  // 一键应用最优参数
+  const applyAiParams = useCallback(() => {
+    if (!aiResult) return;
+    const { params } = aiResult.best;
+    setDirection(params.dir);
+    setLeverage(config.leverage || 1);
+    // 把最优参数更新到云端（写入 strategy config）
+    const newConfig = {
+      ...config,
+      maxTiers:       params.maxTiers,
+      tierMultiplier: params.tierMultiplier,
+      minGapPct:      params.minGapPct,
+      direction:      params.dir,
+    };
+    setSyncStatus('syncing');
+    db.upsertStrategy(strategy.user_code || '', { ...strategy, config: newConfig })
+      .then(() => setSyncStatus('ok'))
+      .catch(() => setSyncStatus('err'));
+    setAiApplied(true);
+  }, [aiResult, config, strategy, setSyncStatus]);
+
   const klineChartData = useMemo(() => klines.slice(-80).map(k => ({
     date:  k.date,
     close: k.close,
@@ -775,6 +979,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
     { id: 'dashboard', label: '策略看板', icon: 'Activity' },
     { id: 'profile',   label: '量价结构', icon: 'BarChart2' },
     { id: 'trades',    label: '交易记录', icon: 'Layers' },
+    { id: 'ai',        label: 'AI 优化',  icon: 'Brain' },
     { id: 'settings',  label: '参数设置', icon: 'Settings' },
   ];
 
@@ -1176,7 +1381,198 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
         </div>
       )}
 
-      {/* ── SETTINGS TAB ── */}
+      {/* ── AI 优化 TAB ── */}
+      {activeTab === 'ai' && (
+        <div className="space-y-5">
+
+          {/* 控制面板 */}
+          <Card className="p-5">
+            <div className="flex items-center gap-2 mb-4">
+              <Icon name="Brain" size={18} className="text-indigo-500"/>
+              <span className="font-bold text-slate-700">AI 参数优化</span>
+              <span className="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">Beta</span>
+            </div>
+            <p className="text-xs text-slate-500 mb-4 leading-relaxed">
+              系统将在历史K线上穷举 <b>{5 * 6 * 5 * 2} 种</b> 参数组合（最大档位×倍数×间距×方向），
+              用前60%数据建 Volume Profile，在后40%模拟交易，找出<b>综合评分最优</b>（高收益+低回撤）的参数。
+            </p>
+
+            <div className="flex items-center gap-3 flex-wrap mb-4">
+              <span className="text-xs text-slate-500 font-medium">回测区间：</span>
+              {[['1m','近1个月'],['3m','近3个月'],['6m','近半年'],['1y','近1年']].map(([v,l]) => (
+                <button key={v} onClick={() => setAiRange(v)}
+                  className={`px-3 py-1.5 text-xs rounded-lg border font-medium transition-all ${aiRange === v ? 'bg-indigo-600 text-white border-indigo-600' : 'border-slate-200 text-slate-500 hover:border-indigo-300'}`}>
+                  {l}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex gap-3">
+              <button onClick={runAiOptimize} disabled={aiRunning || klines.length < 50}
+                className={`flex-1 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${aiRunning ? 'bg-slate-100 text-slate-400 cursor-not-allowed' : 'bg-gradient-to-r from-indigo-600 to-violet-600 text-white hover:from-indigo-700 hover:to-violet-700 shadow-md shadow-indigo-200'}`}>
+                {aiRunning
+                  ? <><Icon name="RefreshCw" size={16} className="animate-spin"/>优化中... {aiProgress}%</>
+                  : <><Icon name="Sparkles" size={16}/>开始 AI 参数优化</>}
+              </button>
+              {aiResult && !aiApplied && (
+                <button onClick={applyAiParams}
+                  className="px-5 py-3 rounded-xl font-bold text-sm bg-emerald-600 text-white hover:bg-emerald-700 flex items-center gap-2 shadow-md shadow-emerald-200 transition-all">
+                  <Icon name="CheckCircle" size={16}/>应用最优参数
+                </button>
+              )}
+              {aiApplied && (
+                <div className="px-5 py-3 rounded-xl text-sm bg-emerald-50 text-emerald-700 font-semibold flex items-center gap-2 border border-emerald-200">
+                  <Icon name="CheckCircle" size={16}/>已应用
+                </div>
+              )}
+            </div>
+
+            {/* 进度条 */}
+            {aiRunning && (
+              <div className="mt-3">
+                <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
+                  <div className="h-full bg-gradient-to-r from-indigo-500 to-violet-500 rounded-full transition-all duration-300"
+                    style={{ width: aiProgress + '%' }}/>
+                </div>
+                <div className="text-xs text-slate-400 mt-1 text-right">已完成 {aiProgress}%</div>
+              </div>
+            )}
+          </Card>
+
+          {/* 最优结果展示 */}
+          {aiResult && (
+            <>
+              {/* 最优参数卡片 */}
+              <Card className="p-5 border-2 border-indigo-200 bg-indigo-50">
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <Icon name="Sparkles" size={18} className="text-indigo-600"/>
+                    <span className="font-bold text-indigo-800">最优参数组合</span>
+                  </div>
+                  <div className={`text-xs px-2 py-1 rounded-full font-bold ${aiResult.best.params.dir === 'long' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-700'}`}>
+                    {aiResult.best.params.dir === 'long' ? '▲ 做多' : '▼ 做空'}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                  {[
+                    { label: '最大档位',   val: aiResult.best.params.maxTiers + ' 档' },
+                    { label: '档位倍数',   val: aiResult.best.params.tierMultiplier + 'x' },
+                    { label: '最小间距',   val: aiResult.best.params.minGapPct + '%' },
+                    { label: '方向',       val: aiResult.best.params.dir === 'long' ? '做多' : '做空' },
+                  ].map(({ label, val }) => (
+                    <div key={label} className="bg-white rounded-lg p-3 text-center border border-indigo-100">
+                      <div className="text-xs text-slate-400 mb-1">{label}</div>
+                      <div className="font-black text-indigo-700">{val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-3 gap-3">
+                  {[
+                    { label: '回测收益率', val: (aiResult.best.roi >= 0 ? '+' : '') + aiResult.best.roi.toFixed(2) + '%',
+                      col: aiResult.best.roi >= 0 ? 'text-emerald-700' : 'text-red-600',
+                      bg:  aiResult.best.roi >= 0 ? 'bg-emerald-50 border-emerald-200' : 'bg-red-50 border-red-200' },
+                    { label: '最大回撤',  val: aiResult.best.maxDrawdown.toFixed(2) + '%',
+                      col: aiResult.best.maxDrawdown > 30 ? 'text-red-600' : 'text-amber-600',
+                      bg:  aiResult.best.maxDrawdown > 30 ? 'bg-red-50 border-red-200' : 'bg-amber-50 border-amber-200' },
+                    { label: '综合评分',  val: aiResult.best.score.toFixed(1),
+                      col: 'text-indigo-700', bg: 'bg-indigo-50 border-indigo-200' },
+                  ].map(({ label, val, col, bg }) => (
+                    <div key={label} className={`rounded-lg p-3 text-center border ${bg}`}>
+                      <div className="text-xs text-slate-400 mb-1">{label}</div>
+                      <div className={`font-black text-base ${col}`}>{val}</div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="mt-3 text-xs text-slate-500 flex gap-4">
+                  <span>模拟交易 <b className="text-slate-700">{aiResult.best.trades}</b> 笔</span>
+                  <span>回测区间 <b className="text-slate-700">{aiResult.btDays}</b> 天</span>
+                  <span>使用K线 <b className="text-slate-700">{aiResult.btKlines.length}</b> 根</span>
+                  <span>搜索空间 <b className="text-slate-700">{aiResult.total}</b> 种</span>
+                </div>
+              </Card>
+
+              {/* Top 10 对比表 */}
+              <Card className="overflow-hidden">
+                <div className="p-4 border-b border-slate-100 flex justify-between items-center">
+                  <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
+                    <Icon name="BarChart2" size={15} className="text-slate-400"/>Top 10 参数方案对比
+                  </span>
+                  <span className="text-xs text-slate-400">综合评分 = 收益率 - 回撤×50</span>
+                </div>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 text-slate-500">
+                        <th className="px-3 py-2 text-left">排名</th>
+                        <th className="px-3 py-2 text-center">方向</th>
+                        <th className="px-3 py-2 text-center">档位</th>
+                        <th className="px-3 py-2 text-center">倍数</th>
+                        <th className="px-3 py-2 text-center">间距</th>
+                        <th className="px-3 py-2 text-right">收益率</th>
+                        <th className="px-3 py-2 text-right">最大回撤</th>
+                        <th className="px-3 py-2 text-right">综合评分</th>
+                        <th className="px-3 py-2 text-center">交易数</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {aiResult.top10.map((r, i) => (
+                        <tr key={i} className={`transition-colors hover:bg-slate-50 ${i === 0 ? 'bg-indigo-50/50' : ''}`}>
+                          <td className="px-3 py-2.5">
+                            {i === 0
+                              ? <span className="text-indigo-700 font-black">🥇 #1</span>
+                              : <span className="text-slate-400 font-mono">#{i+1}</span>}
+                          </td>
+                          <td className="px-3 py-2.5 text-center">
+                            <span className={`tier-badge ${r.params.dir === 'long' ? 'bg-emerald-100 text-emerald-700' : 'bg-red-100 text-red-600'}`}>
+                              {r.params.dir === 'long' ? '▲多' : '▼空'}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5 text-center font-semibold text-slate-700">{r.params.maxTiers}</td>
+                          <td className="px-3 py-2.5 text-center text-slate-600">{r.params.tierMultiplier}x</td>
+                          <td className="px-3 py-2.5 text-center text-slate-600">{r.params.minGapPct}%</td>
+                          <td className={`px-3 py-2.5 text-right font-bold ${r.roi >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                            {r.roi >= 0 ? '+' : ''}{r.roi.toFixed(2)}%
+                          </td>
+                          <td className={`px-3 py-2.5 text-right font-semibold ${r.maxDrawdown > 30 ? 'text-red-500' : 'text-amber-600'}`}>
+                            -{r.maxDrawdown.toFixed(1)}%
+                          </td>
+                          <td className="px-3 py-2.5 text-right font-bold text-indigo-700">{r.score.toFixed(1)}</td>
+                          <td className="px-3 py-2.5 text-center text-slate-500">{r.trades}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </Card>
+
+              {/* 评分说明 */}
+              <div className="bg-slate-50 rounded-xl p-4 text-xs text-slate-500 leading-relaxed border border-slate-100">
+                <div className="font-semibold text-slate-600 mb-2 flex items-center gap-1"><Icon name="Info" size={13}/>评分算法说明</div>
+                <div className="space-y-1">
+                  <p><b>综合评分</b> = 回测收益率(%) - 最大回撤(%) × 50</p>
+                  <p><b>回测方法</b>：前60%K线建 Volume Profile 识别结构，后40%模拟实际交易（左侧分批建仓 + 量价止盈）</p>
+                  <p><b>熔断保护</b>：单次回测中回撤超60%自动停止，避免极端参数污染结果</p>
+                  <p><b>注意</b>：历史回测不代表未来收益，建议结合当前市场结构综合判断后再应用</p>
+                </div>
+              </div>
+            </>
+          )}
+
+          {/* 空状态 */}
+          {!aiResult && !aiRunning && (
+            <div className="text-center py-16 text-slate-400">
+              <Icon name="Brain" size={48} className="mx-auto mb-4 opacity-20"/>
+              <p className="font-medium text-slate-500">点击「开始 AI 参数优化」</p>
+              <p className="text-sm mt-1">系统将自动穷举最佳参数组合</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── SETTINGS TAB ── */}}
       {activeTab === 'settings' && (
         <div className="space-y-5">
           <Card className="p-5">
