@@ -365,48 +365,72 @@ function detectLevels(profile, currentPrice, minGapPct = 1.5, minLevels = 6) {
   return { supports, resistances, poc, hvns, allSupports, allResistances, dataInfo };
 }
 
-// 做多分档：支撑位往下买
-function computeLongTiers(supports, currentPrice, config) {
-  const maxTiers = config.maxTiers || 5;
-  const capitalPerTier = config.totalCapital / maxTiers;
-  return supports.slice(0, maxTiers).map((s, i) => {
-    const pricePct = ((currentPrice - s.priceMid) / currentPrice * 100).toFixed(2);
-    const multiplier = 1 + i * (config.tierMultiplier - 1);
-    const amount = Math.min(capitalPerTier * multiplier, config.totalCapital * 0.4);
+// ─── 分档计划核心计算（保证金维度，资金安全）───────────────
+// 关键约定：
+//   totalCapital  = 本金（= 总可用保证金预算）
+//   leverage      = 杠杆倍数（现货=1）
+//   margin_i      = 第i档实际占用保证金
+//   amount_i      = 名义金额 = margin_i × leverage
+//   ∑ margin_i   ≤ totalCapital × maxCapitalUsePct（默认90%，留10%应急）
+//   单档 margin_i ≤ totalCapital × maxSinglePct（默认35%）
+function buildTierPlan(levels, currentPrice, config, direction) {
+  const maxTiers       = config.maxTiers    || 5;
+  const lev            = config.leverage    || 1;
+  const tierMult       = config.tierMultiplier || 1.5;
+  const totalCapital   = config.totalCapital   || 10000;
+  const maxCapitalUse  = 0.90;   // 最多用90%本金做保证金，留余量
+  const maxSinglePct   = 0.35;   // 单档保证金不超过本金35%
+
+  const items = direction === 'long' ? levels : levels;
+  const usedItems = items.slice(0, maxTiers);
+  if (!usedItems.length) return [];
+
+  // 第一步：按比例算出各档权重（倍乘递增）
+  const weights = usedItems.map((_, i) => 1 + i * (tierMult - 1));
+  const weightSum = weights.reduce((a, b) => a + b, 0);
+
+  // 第二步：总可用保证金预算
+  const totalMarginBudget = totalCapital * maxCapitalUse;
+  // 单档保证金硬上限
+  const maxSingleMargin = totalCapital * maxSinglePct;
+
+  // 第三步：按权重分配保证金，单档超限时截断并将剩余重分配
+  let margins = weights.map(w => Math.min((w / weightSum) * totalMarginBudget, maxSingleMargin));
+  // 截断后可能总量变少，做一次归一化确保总量不超预算
+  const marginSum = margins.reduce((a, b) => a + b, 0);
+  if (marginSum > totalMarginBudget) {
+    const scale = totalMarginBudget / marginSum;
+    margins = margins.map(m => m * scale);
+  }
+
+  return usedItems.map((lv, i) => {
+    const margin  = margins[i];          // 实际保证金
+    const amount  = margin * lev;        // 名义金额（合约面值）
+    const priceDiff = direction === 'long'
+      ? ((currentPrice - lv.priceMid) / currentPrice * 100)
+      : ((lv.priceMid - currentPrice)  / currentPrice * 100);
+    const pricePct = priceDiff.toFixed(2);
     return {
-      tier: i + 1,
-      direction: 'long',
-      price: s.priceMid,
-      priceFormatted: s.priceMid.toFixed(2),
-      pricePct,            // 跌幅
-      amount: Math.round(amount),
-      volStrength: s.volPct,
-      label: `-${pricePct}%`,
-      labelColor: 'text-red-500',
+      tier:           i + 1,
+      direction,
+      price:          lv.priceMid,
+      priceFormatted: lv.priceMid.toFixed(2),
+      pricePct,
+      margin:         Math.round(margin),   // 实际保证金
+      amount:         Math.round(amount),   // 名义金额
+      volStrength:    lv.volPct,
+      label:          direction === 'long' ? `-${pricePct}%` : `+${pricePct}%`,
+      labelColor:     direction === 'long' ? 'text-red-500' : 'text-emerald-600',
     };
   });
 }
 
-// 做空分档：压力位往上卖空
+function computeLongTiers(supports, currentPrice, config) {
+  return buildTierPlan(supports, currentPrice, config, 'long');
+}
+
 function computeShortTiers(resistances, currentPrice, config) {
-  const maxTiers = config.maxTiers || 5;
-  const capitalPerTier = config.totalCapital / maxTiers;
-  return resistances.slice(0, maxTiers).map((r, i) => {
-    const pricePct = ((r.priceMid - currentPrice) / currentPrice * 100).toFixed(2);
-    const multiplier = 1 + i * (config.tierMultiplier - 1);
-    const amount = Math.min(capitalPerTier * multiplier, config.totalCapital * 0.4);
-    return {
-      tier: i + 1,
-      direction: 'short',
-      price: r.priceMid,
-      priceFormatted: r.priceMid.toFixed(2),
-      pricePct,            // 涨幅
-      amount: Math.round(amount),
-      volStrength: r.volPct,
-      label: `+${pricePct}%`,
-      labelColor: 'text-emerald-600',
-    };
-  });
+  return buildTierPlan(resistances, currentPrice, config, 'short');
 }
 
 // 兼容旧调用
@@ -676,8 +700,10 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const profile = useMemo(() => buildVolumeProfile(vpKlines.length ? vpKlines : klines, 80), [vpKlines, klines]);
   const levels  = useMemo(() => detectLevels(profile, ticker || 0, config.minGapPct || 2.0, config.maxTiers || 5), [profile, ticker, config.minGapPct, config.maxTiers]);
   const vpCfg   = VP_CONFIGS[vpPeriod] || VP_CONFIGS['日内'];
-  const longTiers  = useMemo(() => computeLongTiers(levels.supports,    ticker || 0, config), [levels.supports,    ticker, config]);
-  const shortTiers = useMemo(() => computeShortTiers(levels.resistances, ticker || 0, config), [levels.resistances, ticker, config]);
+  // 把运行时 leverage 合并进 config 传给计算函数
+  const configWithLev = useMemo(() => ({ ...config, leverage }), [config, leverage]);
+  const longTiers  = useMemo(() => computeLongTiers(levels.supports,    ticker || 0, configWithLev), [levels.supports,    ticker, configWithLev]);
+  const shortTiers = useMemo(() => computeShortTiers(levels.resistances, ticker || 0, configWithLev), [levels.resistances, ticker, configWithLev]);
   const tiers = direction === 'long' ? longTiers : shortTiers;
 
   // ---- Portfolio stats (支持做多/做空) ----
@@ -1219,26 +1245,29 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
 
           {/* Tier plan table */}
           {(() => {
-            // ── 预计算每档的：档间距、累计均价、累计保证金 ──
-            let cumQty = 0, cumUsdt = 0;
+            // ── 预计算每档：档间距 / 累计均价 / 累计保证金 / 本金使用率 ──
+            let cumQty = 0, cumNotional = 0, cumMarginAcc = 0;
             const tiersEnriched = tiers.map((t, i) => {
               const prev = tiers[i - 1];
-              // 档间距：当前档与上一档的价格距离%
+              // 档间距（与上一档目标价的百分比距离）
               const gapPct = prev
                 ? Math.abs((t.price - prev.price) / prev.price * 100)
                 : null;
-              // 累计加权均价：∑(金额) / ∑(数量)
+              // 用名义金额计算均价（价格维度，与杠杆无关）
               const qty = t.amount / t.price;
-              cumQty  += qty;
-              cumUsdt += t.amount;
-              const avgCostSoFar = cumUsdt / cumQty;
-              // 累计保证金
-              const cumMargin = leverage > 1 ? cumUsdt / leverage : cumUsdt;
-              return { ...t, gapPct, avgCostSoFar, cumUsdt, cumMargin, cumQty };
+              cumQty        += qty;
+              cumNotional   += t.amount;
+              cumMarginAcc  += (t.margin || t.amount);   // margin 优先
+              const avgCostSoFar = cumNotional / cumQty;
+              // 本金使用率 = 累计保证金 / 总本金
+              const capitalUsePct = (cumMarginAcc / (config.totalCapital || 10000)) * 100;
+              return { ...t, gapPct, avgCostSoFar, cumNotional, cumMarginAcc, capitalUsePct, cumQty };
             });
-            const totalUsdt  = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].cumUsdt  : 0;
-            const totalMargin = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].cumMargin : 0;
-            const totalAvgCost = tiersEnriched.length ? tiersEnriched[tiersEnriched.length-1].avgCostSoFar : 0;
+            const last = tiersEnriched[tiersEnriched.length - 1];
+            const totalNotional  = last ? last.cumNotional  : 0;
+            const totalMargin    = last ? last.cumMarginAcc : 0;
+            const totalAvgCost   = last ? last.avgCostSoFar : 0;
+            const totalCapUsePct = last ? last.capitalUsePct : 0;
             const colCount = 7 + (leverage > 1 ? 1 : 0);
 
             return (
@@ -1261,8 +1290,8 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                         <th className="px-3 py-2.5 text-right">目标价</th>
                         <th className="px-3 py-2.5 text-right">{direction === 'long' ? '距当前↓' : '距当前↑'}</th>
                         <th className="px-3 py-2.5 text-right text-slate-400">档间距</th>
-                        <th className="px-3 py-2.5 text-right">名义金额</th>
-                        {leverage > 1 && <th className="px-3 py-2.5 text-right text-orange-500">保证金</th>}
+                        <th className="px-3 py-2.5 text-right text-orange-500">{leverage > 1 ? '保证金' : '金额'}</th>
+                        {leverage > 1 && <th className="px-3 py-2.5 text-right text-slate-500">名义金额</th>}
                         <th className="px-3 py-2.5 text-right text-indigo-500">累计均价</th>
                         <th className="px-3 py-2.5 text-center">量区</th>
                         <th className="px-3 py-2.5 text-center">操作</th>
@@ -1294,25 +1323,28 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                               : <span className="text-slate-300">首档</span>}
                           </td>
 
-                          {/* 名义金额 */}
-                          <td className="px-3 py-3 text-right font-semibold text-slate-700">
-                            ${t.amount.toLocaleString()}
+                          {/* 保证金（主要资金列）*/}
+                          <td className="px-3 py-3 text-right font-bold text-orange-500">
+                            ${(t.margin || t.amount).toLocaleString()}
                           </td>
 
-                          {/* 实际保证金（有杠杆才显示） */}
+                          {/* 名义金额（有杠杆时额外显示）*/}
                           {leverage > 1 && (
-                            <td className="px-3 py-3 text-right font-semibold text-orange-500">
-                              ${Math.round(t.amount / leverage).toLocaleString()}
+                            <td className="px-3 py-3 text-right text-slate-500">
+                              ${t.amount.toLocaleString()}
                             </td>
                           )}
 
-                          {/* 累计均价（截至该档全部建仓后的加权均成本） */}
+                          {/* 累计均价 + 本金使用率 */}
                           <td className="px-3 py-3 text-right">
                             <div className="font-bold text-indigo-600 font-mono">
                               ${t.avgCostSoFar.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:1})}
                             </div>
-                            <div className="text-slate-400 text-[10px] mt-0.5">
-                              累计 ${t.cumUsdt.toLocaleString()}
+                            <div className="text-[10px] mt-0.5 flex items-center gap-1 justify-end">
+                              <span className="text-slate-400">保证金累计</span>
+                              <span className={`font-semibold ${t.capitalUsePct > 85 ? 'text-red-500' : t.capitalUsePct > 60 ? 'text-amber-500' : 'text-slate-500'}`}>
+                                {t.capitalUsePct.toFixed(0)}%
+                              </span>
                             </div>
                           </td>
 
@@ -1342,31 +1374,36 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                     {/* 汇总尾行 */}
                     {tiersEnriched.length > 0 && (
                       <tfoot>
-                        <tr className={`border-t-2 font-semibold text-xs ${direction === 'long' ? 'border-emerald-200 bg-emerald-50' : 'border-red-200 bg-red-50'}`}>
-                          <td className="px-3 py-3 text-slate-500" colSpan="2">
-                            全仓建完后
+                        <tr className={`border-t-2 text-xs ${direction === 'long' ? 'border-emerald-200 bg-emerald-50' : 'border-red-200 bg-red-50'}`}>
+                          <td className="px-3 py-3 text-slate-500 font-semibold" colSpan="2">全仓建完后</td>
+                          <td className="px-3 py-3 text-right text-slate-400" colSpan="2">{tiers.length} 档合计</td>
+
+                          {/* 总保证金 + 本金使用率 */}
+                          <td className="px-3 py-3 text-right">
+                            <div className="font-black text-orange-600">${Math.round(totalMargin).toLocaleString()}</div>
+                            <div className={`text-[10px] font-semibold mt-0.5 ${totalCapUsePct > 85 ? 'text-red-500' : totalCapUsePct > 65 ? 'text-amber-500' : 'text-emerald-600'}`}>
+                              占本金 {totalCapUsePct.toFixed(1)}%
+                              {totalCapUsePct > 85 && ' ⚠'}
+                            </div>
                           </td>
-                          <td className="px-3 py-3 text-right text-slate-400" colSpan="2">
-                            {tiers.length} 档合计
-                          </td>
-                          <td className="px-3 py-3 text-right text-slate-700">
-                            ${totalUsdt.toLocaleString()}
-                          </td>
+
+                          {/* 名义金额合计 */}
                           {leverage > 1 && (
-                            <td className="px-3 py-3 text-right text-orange-600">
-                              ${Math.round(totalMargin).toLocaleString()}
+                            <td className="px-3 py-3 text-right text-slate-500">
+                              <div>${Math.round(totalNotional).toLocaleString()}</div>
+                              <div className="text-[10px] text-slate-400">{leverage}x 杠杆</div>
                             </td>
                           )}
+
+                          {/* 全仓均价 */}
                           <td className="px-3 py-3 text-right">
                             <div className={`font-black text-sm ${direction === 'long' ? 'text-emerald-700' : 'text-red-600'}`}>
                               均价 ${totalAvgCost.toLocaleString('en',{minimumFractionDigits:0,maximumFractionDigits:1})}
                             </div>
                             <div className="text-[10px] text-slate-400 mt-0.5">
-                              {ticker && direction === 'long'
+                              {ticker && totalAvgCost > 0 && (direction === 'long'
                                 ? `需涨 ${((ticker/totalAvgCost-1)*100).toFixed(2)}% 回本`
-                                : ticker
-                                  ? `需跌 ${((1-ticker/totalAvgCost)*100).toFixed(2)}% 回本`
-                                  : ''}
+                                : `需跌 ${((1-ticker/totalAvgCost)*100).toFixed(2)}% 回本`)}
                             </div>
                           </td>
                           <td colSpan="2"/>
