@@ -259,45 +259,91 @@ function buildVolumeProfile(klines, bins = 40) {
   return buckets.map(b => ({ ...b, volPct: maxVol > 0 ? b.volume / maxVol : 0 }));
 }
 
-function detectLevels(profile, currentPrice) {
-  if (!profile.length) return { supports: [], resistances: [], poc: null, hvns: [] };
+function detectLevels(profile, currentPrice, minGapPct = 1.5) {
+  if (!profile.length) return { supports: [], resistances: [], poc: null, hvns: [], allSupports: [], allResistances: [] };
+
   // POC = highest volume bucket
   const sorted = [...profile].sort((a, b) => b.volume - a.volume);
   const poc = sorted[0];
-  // HVN: top 30% by volume
-  const threshold = sorted[Math.floor(sorted.length * 0.3)].volume;
+
+  // HVN: top 25% by volume (更严格，减少噪音)
+  const threshold = sorted[Math.floor(sorted.length * 0.25)].volume;
   const hvns = profile.filter(b => b.volume >= threshold);
-  // Split into supports (below current) and resistances (above current)
-  const supports    = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
-  const resistances = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
-  return { supports, resistances, poc, hvns };
+
+  // 按价格排序
+  const allSupports    = hvns.filter(b => b.priceMid < currentPrice).sort((a, b) => b.priceMid - a.priceMid);
+  const allResistances = hvns.filter(b => b.priceMid > currentPrice).sort((a, b) => a.priceMid - b.priceMid);
+
+  // 去密：相邻档位间距必须 >= minGapPct%，保留量能更强的那个
+  function dedupe(levels, refPrice) {
+    const result = [];
+    for (const lv of levels) {
+      const last = result[result.length - 1];
+      if (!last) { result.push(lv); continue; }
+      const gap = Math.abs(lv.priceMid - last.priceMid) / refPrice * 100;
+      if (gap < minGapPct) {
+        // 合并：保留量能更强的
+        if (lv.volume > last.volume) result[result.length - 1] = lv;
+      } else {
+        result.push(lv);
+      }
+    }
+    return result;
+  }
+
+  const supports    = dedupe(allSupports,    currentPrice);
+  const resistances = dedupe(allResistances, currentPrice);
+
+  return { supports, resistances, poc, hvns, allSupports, allResistances };
 }
 
-// Compute suggested entry tiers based on support levels
-function computeTiers(supports, currentPrice, config) {
-  const tiers = [];
+// 做多分档：支撑位往下买
+function computeLongTiers(supports, currentPrice, config) {
   const maxTiers = config.maxTiers || 5;
   const capitalPerTier = config.totalCapital / maxTiers;
-
-  // Use top N supports
-  const usedSupports = supports.slice(0, maxTiers);
-
-  usedSupports.forEach((s, i) => {
-    const priceDrop = ((currentPrice - s.priceMid) / currentPrice * 100).toFixed(2);
-    const multiplier = 1 + i * (config.tierMultiplier - 1); // e.g. 1, 1.5, 2, 2.5, 3
+  return supports.slice(0, maxTiers).map((s, i) => {
+    const pricePct = ((currentPrice - s.priceMid) / currentPrice * 100).toFixed(2);
+    const multiplier = 1 + i * (config.tierMultiplier - 1);
     const amount = Math.min(capitalPerTier * multiplier, config.totalCapital * 0.4);
-    tiers.push({
+    return {
       tier: i + 1,
+      direction: 'long',
       price: s.priceMid,
       priceFormatted: s.priceMid.toFixed(2),
-      dropPct: priceDrop,
+      pricePct,            // 跌幅
       amount: Math.round(amount),
       volStrength: s.volPct,
-      status: 'pending', // pending | triggered | filled
-    });
+      label: `-${pricePct}%`,
+      labelColor: 'text-red-500',
+    };
   });
+}
 
-  return tiers;
+// 做空分档：压力位往上卖空
+function computeShortTiers(resistances, currentPrice, config) {
+  const maxTiers = config.maxTiers || 5;
+  const capitalPerTier = config.totalCapital / maxTiers;
+  return resistances.slice(0, maxTiers).map((r, i) => {
+    const pricePct = ((r.priceMid - currentPrice) / currentPrice * 100).toFixed(2);
+    const multiplier = 1 + i * (config.tierMultiplier - 1);
+    const amount = Math.min(capitalPerTier * multiplier, config.totalCapital * 0.4);
+    return {
+      tier: i + 1,
+      direction: 'short',
+      price: r.priceMid,
+      priceFormatted: r.priceMid.toFixed(2),
+      pricePct,            // 涨幅
+      amount: Math.round(amount),
+      volStrength: r.volPct,
+      label: `+${pricePct}%`,
+      labelColor: 'text-emerald-600',
+    };
+  });
+}
+
+// 兼容旧调用
+function computeTiers(supports, currentPrice, config) {
+  return computeLongTiers(supports, currentPrice, config);
 }
 
 // ─────────────────────────────────────────────
@@ -490,8 +536,10 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const [tradesLoaded, setTradesLoaded] = useState(false);
   const [interval, setIntervalVal] = useState('1h');
   const [showAddTrade, setShowAddTrade] = useState(false);
-  const [addTradeForm, setAddTradeForm] = useState({ type: 'buy', price: '', usdt: '', note: '', tier: 1 });
+  const [addTradeForm, setAddTradeForm] = useState({ type: 'buy', direction: 'long', price: '', usdt: '', note: '', tier: 1 });
   const [showSqlHint, setShowSqlHint] = useState(false);
+  // 策略方向: 'long' | 'short'
+  const [direction, setDirection] = useState(() => (strategy.config?.direction || 'long'));
 
   const config = strategy.config || {};
   const symbol = strategy.symbol;
@@ -532,34 +580,55 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
 
   // ---- Volume Profile & Levels ----
   const profile = useMemo(() => buildVolumeProfile(klines, 50), [klines]);
-  const levels  = useMemo(() => detectLevels(profile, ticker || 0), [profile, ticker]);
-  const tiers   = useMemo(() => computeTiers(levels.supports, ticker || 0, config), [levels.supports, ticker, config]);
+  const levels  = useMemo(() => detectLevels(profile, ticker || 0, config.minGapPct || 2.0), [profile, ticker, config.minGapPct]);
+  const longTiers  = useMemo(() => computeLongTiers(levels.supports,    ticker || 0, config), [levels.supports,    ticker, config]);
+  const shortTiers = useMemo(() => computeShortTiers(levels.resistances, ticker || 0, config), [levels.resistances, ticker, config]);
+  const tiers = direction === 'long' ? longTiers : shortTiers;
 
-  // ---- Portfolio stats ----
+  // ---- Portfolio stats (支持做多/做空) ----
   const portfolioStats = useMemo(() => {
     if (!trades.length || !ticker) return null;
-    let totalUsdt = 0, totalQty = 0, realizedPnl = 0;
-    const buys = [];
+    // 做多统计
+    let longUsdt = 0, longQty = 0, longRealized = 0;
+    // 做空统计 (short_open=卖空开仓 short_close=买回平仓)
+    let shortUsdt = 0, shortQty = 0, shortRealized = 0;
+
     [...trades].sort((a, b) => new Date(a.executed_at) - new Date(b.executed_at)).forEach(t => {
-      if (t.type === 'buy') {
-        totalUsdt += t.usdt;
-        totalQty  += t.qty;
-        buys.push({ price: t.price, qty: t.qty, usdt: t.usdt });
-      } else {
-        const avgCost = totalQty > 0 ? totalUsdt / totalQty : 0;
-        const proceeds = t.usdt;
-        realizedPnl += proceeds - t.qty * avgCost;
-        totalQty  -= t.qty;
-        totalUsdt -= t.qty * avgCost;
+      if (t.direction === 'short') {
+        if (t.type === 'sell') { // 开空
+          shortUsdt += t.usdt; shortQty += t.qty;
+        } else { // 平空(买回)
+          const avgOpen = shortQty > 0 ? shortUsdt / shortQty : 0;
+          shortRealized += (avgOpen - t.price) * t.qty; // 做空盈利 = 开仓均价 - 平仓价
+          shortQty  -= t.qty;
+          shortUsdt -= t.qty * avgOpen;
+        }
+      } else { // 做多
+        if (t.type === 'buy') {
+          longUsdt += t.usdt; longQty += t.qty;
+        } else {
+          const avgCost = longQty > 0 ? longUsdt / longQty : 0;
+          longRealized += (t.price - avgCost) * t.qty;
+          longQty  -= t.qty;
+          longUsdt -= t.qty * avgCost;
+        }
       }
     });
-    const avgCost  = totalQty > 0 ? totalUsdt / totalQty : 0;
-    const mktValue = totalQty * ticker;
-    const unrealizedPnl = mktValue - totalUsdt;
-    const totalPnl = realizedPnl + unrealizedPnl;
-    const usedCapital = (totalUsdt / (config.totalCapital || 1)) * 100;
-    return { totalQty, avgCost, mktValue, totalUsdt, realizedPnl, unrealizedPnl, totalPnl, usedCapital };
-  }, [trades, ticker, config]);
+
+    // 当前方向的统计
+    const isShort = direction === 'short';
+    const holdQty    = isShort ? shortQty  : longQty;
+    const holdUsdt   = isShort ? shortUsdt : longUsdt;
+    const realized   = isShort ? shortRealized : longRealized;
+    const avgCost    = holdQty > 0 ? holdUsdt / holdQty : 0;
+    // 做多：持仓市值 = qty * 当前价; 做空：盈亏方向相反
+    const mktValue      = holdQty * ticker;
+    const unrealizedPnl = isShort
+      ? (avgCost - ticker) * holdQty   // 做空：开仓价 > 当前价 = 盈
+      : mktValue - holdUsdt;           // 做多：当前价 > 成本 = 盈
+    const usedCapital = (holdUsdt / (config.totalCapital || 1)) * 100;
+    return { holdQty, avgCost, mktValue, holdUsdt, realizedPnl: realized, unrealizedPnl, usedCapital, isShort };
+  }, [trades, ticker, config, direction]);
 
   // ---- Add trade ----
   const handleAddTrade = async () => {
@@ -571,6 +640,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
       id:          Date.now().toString(),
       strategy_id: strategy.id,
       type:        addTradeForm.type,
+      direction:   addTradeForm.direction || direction,
       price, qty, usdt,
       tier:        parseInt(addTradeForm.tier) || 1,
       note:        addTradeForm.note,
@@ -582,7 +652,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
       setTrades(prev => [trade, ...prev]);
       setSyncStatus('ok');
       setShowAddTrade(false);
-      setAddTradeForm({ type: 'buy', price: '', usdt: '', note: '', tier: 1 });
+      setAddTradeForm({ type: 'buy', direction: 'long', price: '', usdt: '', note: '', tier: 1 });
     } catch (e) {
       setSyncStatus('err');
       alert('保存失败：' + e.message);
@@ -603,19 +673,45 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
   const changeColor = stats24h?.change >= 0 ? 'text-emerald-600' : 'text-red-500';
   const changeSign  = stats24h?.change >= 0 ? '+' : '';
 
-  // ---- Next action signal ----
+  // ---- Next action signal (做多/做空双向) ----
   const signal = useMemo(() => {
     if (!ticker || !tiers.length) return null;
-    // Check if current price is near any tier
-    const nearTier = tiers.find(t => Math.abs((ticker - t.price) / ticker) < 0.01);
-    if (nearTier) return { type: 'BUY', tier: nearTier.tier, price: nearTier.price, amount: nearTier.amount, reason: `价格接近第${nearTier.tier}档支撑位 (成交量密集区)` };
-    // Check sell signal: price near resistance
-    const nearRes = levels.resistances[0];
-    if (nearRes && Math.abs((ticker - nearRes.priceMid) / ticker) < 0.015) {
-      if (portfolioStats?.totalQty > 0) return { type: 'SELL', price: nearRes.priceMid, reason: `价格接近压力位，建议部分止盈` };
+    const nearTier = tiers.find(t => Math.abs((ticker - t.price) / ticker) < 0.012);
+    if (direction === 'long') {
+      if (nearTier) return {
+        tradeType: 'buy', tier: nearTier.tier, price: nearTier.price, amount: nearTier.amount,
+        title: `🟢 做多买入信号 — 第 ${nearTier.tier} 档`,
+        reason: `价格接近支撑位 $${nearTier.price.toFixed(0)}（成交量密集区），建议左侧分批建多仓`,
+        btnColor: 'success', btnLabel: '记录买入',
+      };
+      // 多头止盈：接近压力位
+      const nearRes = levels.resistances[0];
+      if (nearRes && Math.abs((ticker - nearRes.priceMid) / ticker) < 0.015 && portfolioStats?.holdQty > 0) {
+        return { tradeType: 'sell', price: nearRes.priceMid, amount: null,
+          title: '🔴 止盈信号 — 接近压力位',
+          reason: `价格接近压力位 $${nearRes.priceMid.toFixed(0)}，建议分批卖出锁利`,
+          btnColor: 'danger', btnLabel: '记录卖出',
+        };
+      }
+    } else { // short
+      if (nearTier) return {
+        tradeType: 'sell', tier: nearTier.tier, price: nearTier.price, amount: nearTier.amount,
+        title: `🔴 做空开仓信号 — 第 ${nearTier.tier} 档`,
+        reason: `价格接近压力位 $${nearTier.price.toFixed(0)}（成交量密集区），建议左侧分批建空仓`,
+        btnColor: 'danger', btnLabel: '记录做空',
+      };
+      // 空头止盈：接近支撑位
+      const nearSup = levels.supports[0];
+      if (nearSup && Math.abs((ticker - nearSup.priceMid) / ticker) < 0.015 && portfolioStats?.holdQty > 0) {
+        return { tradeType: 'buy', price: nearSup.priceMid, amount: null,
+          title: '🟢 止盈信号 — 接近支撑位',
+          reason: `价格接近支撑位 $${nearSup.priceMid.toFixed(0)}，建议买回平仓锁利`,
+          btnColor: 'success', btnLabel: '记录平空',
+        };
+      }
     }
     return null;
-  }, [ticker, tiers, levels, portfolioStats]);
+  }, [ticker, tiers, levels, portfolioStats, direction]);
 
   const klineChartData = useMemo(() => klines.slice(-80).map(k => ({
     date:  k.date,
@@ -672,6 +768,24 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
             </div>
           </div>
 
+          {/* 方向切换 */}
+          <div className="flex items-center gap-2">
+            <span className="text-xs text-slate-500 font-medium">策略方向：</span>
+            <div className="flex rounded-lg border border-slate-200 overflow-hidden text-xs font-semibold">
+              <button onClick={() => setDirection('long')}
+                className={`px-4 py-2 transition-all flex items-center gap-1.5 ${direction === 'long' ? 'bg-emerald-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
+                ▲ 做多
+              </button>
+              <button onClick={() => setDirection('short')}
+                className={`px-4 py-2 transition-all flex items-center gap-1.5 border-l border-slate-200 ${direction === 'short' ? 'bg-red-500 text-white' : 'bg-white text-slate-500 hover:bg-slate-50'}`}>
+                ▼ 做空
+              </button>
+            </div>
+            <span className={`text-xs px-2 py-1 rounded-full font-medium ${direction === 'long' ? 'bg-emerald-50 text-emerald-700' : 'bg-red-50 text-red-700'}`}>
+              {direction === 'long' ? '在支撑位分批建多仓' : '在压力位分批建空仓'}
+            </span>
+          </div>
+
           {error && (
             <div className="bg-red-50 border border-red-100 rounded-xl p-3 text-sm text-red-600 flex items-center gap-2">
               <Icon name="AlertTriangle" size={16}/> {error}
@@ -680,41 +794,54 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
 
           {/* Signal alert */}
           {signal && (
-            <div className={`rounded-xl p-4 border flex items-start gap-3 ${signal.type === 'BUY' ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}>
-              <Icon name="Zap" size={18} className={signal.type === 'BUY' ? 'text-emerald-600 mt-0.5' : 'text-red-500 mt-0.5'}/>
+            <div className={`rounded-xl p-4 border flex items-start gap-3 ${signal.btnColor === 'success' ? 'bg-emerald-50 border-emerald-100' : 'bg-red-50 border-red-100'}`}>
+              <Icon name="Zap" size={18} className={`mt-0.5 ${signal.btnColor === 'success' ? 'text-emerald-600' : 'text-red-500'}`}/>
               <div className="flex-1">
-                <div className={`font-bold text-sm ${signal.type === 'BUY' ? 'text-emerald-700' : 'text-red-600'}`}>
-                  {signal.type === 'BUY' ? `🟢 触发买入信号 — 第 ${signal.tier} 档` : '🔴 触发卖出信号'}
-                </div>
+                <div className={`font-bold text-sm ${signal.btnColor === 'success' ? 'text-emerald-700' : 'text-red-600'}`}>{signal.title}</div>
                 <div className="text-xs text-slate-600 mt-0.5">{signal.reason}</div>
-                {signal.amount && <div className="text-xs font-semibold text-slate-700 mt-1">建议买入金额：${signal.amount.toLocaleString()} USDT</div>}
+                {signal.amount && <div className="text-xs font-semibold text-slate-700 mt-1">建议金额：${signal.amount.toLocaleString()} USDT</div>}
               </div>
-              <Btn variant={signal.type === 'BUY' ? 'success' : 'danger'} className="text-xs px-3 py-1.5"
-                onClick={() => { setAddTradeForm(f => ({ ...f, type: signal.type === 'BUY' ? 'buy' : 'sell', price: signal.price?.toFixed(2) || ticker?.toFixed(2), usdt: signal.amount?.toString() || '', tier: signal.tier || 1 })); setShowAddTrade(true); }}>
-                记录交易
+              <Btn variant={signal.btnColor} className="text-xs px-3 py-1.5"
+                onClick={() => { setAddTradeForm(f => ({ ...f, type: signal.tradeType, direction, price: signal.price?.toFixed(2) || ticker?.toFixed(2), usdt: signal.amount?.toString() || '', tier: signal.tier || 1 })); setShowAddTrade(true); }}>
+                {signal.btnLabel}
               </Btn>
             </div>
           )}
 
           {/* Stats row */}
-          {portfolioStats && (
-            <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-              {[
-                { label: '持仓数量', val: portfolioStats.totalQty.toFixed(5) + ' ' + symbol.replace('USDT',''), sub: `均价 $${portfolioStats.avgCost.toFixed(2)}` },
-                { label: '持仓市值', val: `$${portfolioStats.mktValue.toFixed(0)}`, sub: `投入 $${portfolioStats.totalUsdt.toFixed(0)}`, col: 'indigo' },
-                { label: '浮动盈亏', val: `${portfolioStats.unrealizedPnl >= 0 ? '+' : ''}$${portfolioStats.unrealizedPnl.toFixed(0)}`, sub: `${portfolioStats.totalQty > 0 ? ((portfolioStats.unrealizedPnl / portfolioStats.totalUsdt) * 100).toFixed(2) : '0.00'}%`, col: portfolioStats.unrealizedPnl >= 0 ? 'emerald' : 'red' },
-                { label: '已用本金', val: `${portfolioStats.usedCapital.toFixed(1)}%`, sub: `已实现 $${portfolioStats.realizedPnl.toFixed(0)}`, col: portfolioStats.usedCapital > 80 ? 'red' : portfolioStats.usedCapital > 50 ? 'amber' : 'emerald' },
-              ].map(({ label, val, sub, col = 'slate' }) => {
-                const bg = { slate: 'bg-slate-50 border-slate-100', indigo: 'bg-indigo-50 border-indigo-100', emerald: 'bg-emerald-50 border-emerald-100', red: 'bg-red-50 border-red-100', amber: 'bg-amber-50 border-amber-100' };
-                const fg = { slate: 'text-slate-700', indigo: 'text-indigo-700', emerald: 'text-emerald-700', red: 'text-red-600', amber: 'text-amber-600' };
-                return (
-                  <div key={label} className={`rounded-xl p-3 border ${bg[col]}`}>
-                    <div className="text-xs text-slate-400 mb-1">{label}</div>
-                    <div className={`font-bold text-sm ${fg[col]}`}>{val}</div>
-                    <div className="text-xs text-slate-400 mt-0.5">{sub}</div>
-                  </div>
-                );
-              })}
+          {portfolioStats && portfolioStats.holdQty > 0.000001 && (
+            <div className="space-y-2">
+              <div className={`text-xs font-semibold px-2 py-1 rounded-full inline-flex items-center gap-1 ${portfolioStats.isShort ? 'bg-red-50 text-red-700' : 'bg-emerald-50 text-emerald-700'}`}>
+                {portfolioStats.isShort ? '▼ 空头持仓' : '▲ 多头持仓'}
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                {[
+                  { label: portfolioStats.isShort ? '空仓数量' : '持仓数量',
+                    val: portfolioStats.holdQty.toFixed(5) + ' ' + symbol.replace('USDT',''),
+                    sub: `${portfolioStats.isShort ? '开空均价' : '均成本'} $${portfolioStats.avgCost.toFixed(2)}` },
+                  { label: portfolioStats.isShort ? '名义价值' : '持仓市值',
+                    val: `$${portfolioStats.mktValue.toFixed(0)}`,
+                    sub: `保证金 $${portfolioStats.holdUsdt.toFixed(0)}`, col: 'indigo' },
+                  { label: '浮动盈亏',
+                    val: `${portfolioStats.unrealizedPnl >= 0 ? '+' : ''}$${portfolioStats.unrealizedPnl.toFixed(0)}`,
+                    sub: `${portfolioStats.holdUsdt > 0 ? ((portfolioStats.unrealizedPnl / portfolioStats.holdUsdt) * 100).toFixed(2) : '0.00'}%`,
+                    col: portfolioStats.unrealizedPnl >= 0 ? 'emerald' : 'red' },
+                  { label: '已用本金',
+                    val: `${portfolioStats.usedCapital.toFixed(1)}%`,
+                    sub: `已实现 $${portfolioStats.realizedPnl.toFixed(0)}`,
+                    col: portfolioStats.usedCapital > 80 ? 'red' : portfolioStats.usedCapital > 50 ? 'amber' : 'emerald' },
+                ].map(({ label, val, sub, col = 'slate' }) => {
+                  const bg = { slate: 'bg-slate-50 border-slate-100', indigo: 'bg-indigo-50 border-indigo-100', emerald: 'bg-emerald-50 border-emerald-100', red: 'bg-red-50 border-red-100', amber: 'bg-amber-50 border-amber-100' };
+                  const fg = { slate: 'text-slate-700', indigo: 'text-indigo-700', emerald: 'text-emerald-700', red: 'text-red-600', amber: 'text-amber-600' };
+                  return (
+                    <div key={label} className={`rounded-xl p-3 border ${bg[col]}`}>
+                      <div className="text-xs text-slate-400 mb-1">{label}</div>
+                      <div className={`font-bold text-sm ${fg[col]}`}>{val}</div>
+                      <div className="text-xs text-slate-400 mt-0.5">{sub}</div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -752,8 +879,11 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
           {/* Tier plan table */}
           <Card className="overflow-hidden">
             <div className="p-4 border-b border-slate-100 flex justify-between items-center">
-              <span className="font-semibold text-sm text-slate-700 flex items-center gap-2"><Icon name="Target" size={16} className="text-indigo-500"/>买入分档计划</span>
-              <span className="text-xs text-slate-400">基于成交量支撑位自动计算</span>
+              <span className="font-semibold text-sm text-slate-700 flex items-center gap-2">
+                <Icon name="Target" size={16} className={direction === 'long' ? 'text-emerald-500' : 'text-red-500'}/>
+                {direction === 'long' ? '▲ 做多分档计划（支撑位建仓）' : '▼ 做空分档计划（压力位建仓）'}
+              </span>
+              <span className="text-xs text-slate-400">{tiers.length} 个关键位 · 去密后</span>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs">
@@ -761,7 +891,7 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                   <tr className="bg-slate-50 text-slate-500">
                     <th className="px-4 py-2 text-left">档位</th>
                     <th className="px-4 py-2 text-right">目标价</th>
-                    <th className="px-4 py-2 text-right">较当前跌幅</th>
+                    <th className="px-4 py-2 text-right">{direction === 'long' ? '距当前跌幅' : '距当前涨幅'}</th>
                     <th className="px-4 py-2 text-right">建议金额</th>
                     <th className="px-4 py-2 text-center">量区强度</th>
                     <th className="px-4 py-2 text-center">操作</th>
@@ -776,21 +906,22 @@ function StrategyDashboard({ userCode, strategy, onBack, syncStatus, setSyncStat
                       <td className="px-4 py-3">
                         <Badge color={t.tier === 1 ? 'indigo' : t.tier <= 3 ? 'amber' : 'orange'}>T{t.tier}</Badge>
                       </td>
-                      <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">${parseFloat(t.priceFormatted).toLocaleString()}</td>
-                      <td className="px-4 py-3 text-right text-red-500 font-semibold">-{t.dropPct}%</td>
-                      <td className="px-4 py-3 text-right font-semibold text-emerald-700">${t.amount.toLocaleString()}</td>
+                      <td className="px-4 py-3 text-right font-mono font-semibold text-slate-700">${parseFloat(t.priceFormatted).toLocaleString('en', {minimumFractionDigits:0, maximumFractionDigits:2})}</td>
+                      <td className={`px-4 py-3 text-right font-semibold ${t.labelColor}`}>{t.label}</td>
+                      <td className="px-4 py-3 text-right font-semibold text-slate-700">${t.amount.toLocaleString()}</td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1 justify-center">
                           <div className="w-16 h-2 bg-slate-100 rounded-full overflow-hidden">
-                            <div className="h-full rounded-full bg-indigo-500" style={{ width: `${t.volStrength * 100}%` }}/>
+                            <div className={`h-full rounded-full ${direction === 'long' ? 'bg-emerald-500' : 'bg-red-400'}`} style={{ width: `${t.volStrength * 100}%` }}/>
                           </div>
                           <span className="text-slate-400">{(t.volStrength * 100).toFixed(0)}%</span>
                         </div>
                       </td>
                       <td className="px-4 py-3 text-center">
-                        <button className="text-xs text-indigo-600 hover:text-indigo-800 font-medium"
-                          onClick={() => { setAddTradeForm(f => ({ ...f, type: 'buy', price: t.price.toFixed(2), usdt: t.amount.toString(), tier: t.tier })); setShowAddTrade(true); }}>
-                          记录
+                        <button
+                          className={`text-xs font-semibold ${direction === 'long' ? 'text-emerald-600 hover:text-emerald-800' : 'text-red-500 hover:text-red-700'}`}
+                          onClick={() => { setAddTradeForm(f => ({ ...f, type: direction === 'long' ? 'buy' : 'sell', direction, price: t.price.toFixed(2), usdt: t.amount.toString(), tier: t.tier })); setShowAddTrade(true); }}>
+                          {direction === 'long' ? '买入' : '做空'}
                         </button>
                       </td>
                     </tr>
@@ -1042,7 +1173,7 @@ function StrategyList({ userCode, onSelect }) {
   const [strategies, setStrategies] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ symbol: 'BTCUSDT', totalCapital: '10000', maxTiers: '5', tierMultiplier: '1.5' });
+  const [form, setForm] = useState({ symbol: 'BTCUSDT', totalCapital: '10000', maxTiers: '5', tierMultiplier: '1.5', direction: 'long', minGapPct: '2.0' });
 
   useEffect(() => {
     (async () => {
@@ -1063,6 +1194,8 @@ function StrategyList({ userCode, onSelect }) {
         totalCapital:   parseFloat(form.totalCapital) || 10000,
         maxTiers:       parseInt(form.maxTiers) || 5,
         tierMultiplier: parseFloat(form.tierMultiplier) || 1.5,
+        direction:      form.direction || 'long',
+        minGapPct:      parseFloat(form.minGapPct) || 2.0,
       },
       status: 'active',
     };
@@ -1110,7 +1243,7 @@ function StrategyList({ userCode, onSelect }) {
                 </div>
                 <div>
                   <div className="font-bold text-slate-800">{s.symbol}</div>
-                  <div className="text-xs text-slate-400">${(s.config?.totalCapital || 0).toLocaleString()} · {s.config?.maxTiers || 5}档</div>
+                  <div className="text-xs text-slate-400">${(s.config?.totalCapital || 0).toLocaleString()} · {s.config?.maxTiers || 5}档 · <span className={s.config?.direction === 'short' ? 'text-red-500' : 'text-emerald-600'}>{s.config?.direction === 'short' ? '▼空' : '▲多'}</span></div>
                 </div>
               </div>
               <button onClick={e => handleDelete(e, s.id)} className="text-slate-200 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100">
@@ -1142,13 +1275,28 @@ function StrategyList({ userCode, onSelect }) {
                   value={form.symbol} onChange={e => setForm(f => ({ ...f, symbol: e.target.value.toUpperCase() }))} placeholder="自定义如 SOLUSDT" />
               </div>
               <Field label="总本金 (USDT)" value={form.totalCapital} onChange={v => setForm(f => ({ ...f, totalCapital: v }))} type="number" suffix="U" />
+              <div>
+                <label className="text-xs font-medium text-slate-500 block mb-2">策略方向</label>
+                <div className="flex rounded-lg border border-slate-200 overflow-hidden text-sm font-semibold">
+                  <button onClick={() => setForm(f => ({ ...f, direction: 'long' }))}
+                    className={`flex-1 py-2.5 transition-all ${form.direction === 'long' ? 'bg-emerald-500 text-white' : 'bg-white text-slate-500'}`}>
+                    ▲ 做多
+                  </button>
+                  <button onClick={() => setForm(f => ({ ...f, direction: 'short' }))}
+                    className={`flex-1 py-2.5 transition-all border-l ${form.direction === 'short' ? 'bg-red-500 text-white' : 'bg-white text-slate-500'}`}>
+                    ▼ 做空
+                  </button>
+                </div>
+              </div>
               <div className="grid grid-cols-2 gap-3">
                 <Field label="最大加仓档位" value={form.maxTiers} onChange={v => setForm(f => ({ ...f, maxTiers: v }))} type="number" />
                 <Field label="档位倍数" value={form.tierMultiplier} onChange={v => setForm(f => ({ ...f, tierMultiplier: v }))} type="number" suffix="x" />
               </div>
+              <Field label="档位最小间距 (% 去密)" value={form.minGapPct} onChange={v => setForm(f => ({ ...f, minGapPct: v }))} type="number" suffix="%" />
               <div className="text-xs text-slate-400 bg-slate-50 rounded-lg p-3 leading-relaxed">
-                <b>档位倍数</b>：每档买入金额递增系数。例如倍数=1.5，首档买$1000，下一档买$1500，依次递增。<br/>
-                <b>档位计划</b>：系统根据 Volume Profile 成交量密集区自动分配买入价位。
+                <b>档位倍数</b>：递增系数，例如1.5 → 首档$1000、次档$1500……<br/>
+                <b>最小间距</b>：过滤掉相邻太近的量价节点，建议2%~5%，避免分档过密。<br/>
+                <b>做空</b>：在压力位分批开空，在支撑位止盈平仓。
               </div>
               <div className="flex gap-2">
                 <Btn variant="secondary" className="flex-1" onClick={() => setShowAdd(false)}>取消</Btn>
